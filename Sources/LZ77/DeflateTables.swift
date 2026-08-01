@@ -45,6 +45,28 @@ enum DeflateTables {
         35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
     ]
 
+    /// The inverse of `lengthBase`: which length symbol encodes a match of a given length,
+    /// indexed by `length - minMatch`.
+    ///
+    /// Inverted once here rather than searched per match. The search it replaces was a scan
+    /// backwards through `lengthBase`, which is twenty-nine comparisons for the commonest
+    /// operation an encoder performs.
+    static let lengthSymbol: [UInt8] = {
+        var symbols = [UInt8](repeating: 0, count: 256)
+
+        for length in 3 ... 258 {
+            var symbol = lengthBase.count - 1
+
+            while lengthBase[symbol] > length {
+                symbol -= 1
+            }
+
+            symbols[length - 3] = UInt8(symbol)
+        }
+
+        return symbols
+    }()
+
     /// §3.2.5: the same shape for the distance alphabet (0...29).
     static let distanceExtraBits: [Int] = [
         0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
