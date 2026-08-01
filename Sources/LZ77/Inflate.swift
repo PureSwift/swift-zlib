@@ -72,6 +72,13 @@ public final class Inflate {
     private var matchLength = 0
     private var matchDistance = 0
 
+    /// A literal already decoded that the caller's buffer had no room for.
+    ///
+    /// Needed because a symbol has to be decoded before it is known whether it is a literal
+    /// wanting a byte of room or the end-of-block marker wanting none, and the decode cannot be
+    /// taken back once the bits are consumed.
+    private var heldLiteral: UInt8?
+
     /// Whether the stream has delivered its end marker.
     public private(set) var isFinished = false
 
@@ -146,13 +153,16 @@ public final class Inflate {
         into destination: UnsafeMutablePointer<UInt8>,
         count: Int
     ) throws(DeflateError) -> Int {
-        guard count > 0 else { return 0 }
-
         self.destination = destination
         self.destinationCapacity = count
         self.destinationCount = 0
 
-        while !self.destinationFull, self.state != .done {
+        // Deliberately not stopping on a full destination: the states that produce bytes report
+        // for themselves when they are blocked on room, and the ones that do not — a block
+        // header, a dynamic table, the end of the stream — can still finish without any. A
+        // stream whose remaining output is nothing at all reaches `done` on a zero-length
+        // buffer, which is what a caller decompressing into an empty result depends on.
+        while self.state != .done {
             guard try self.step() else { break }
         }
 
@@ -218,10 +228,12 @@ public final class Inflate {
                 self.storedRemaining -= 1
             }
 
-            if self.storedRemaining == 0 {
-                self.endBlock()
+            guard self.storedRemaining == 0 else {
+                // Still bytes to copy, so the loop above ended on a full destination.
+                return false
             }
 
+            self.endBlock()
             return true
 
         case .dynamicCounts:
@@ -327,13 +339,31 @@ public final class Inflate {
                 throw DeflateError("internal: no literal table")
             }
 
-            while !self.destinationFull {
+            while true {
+                // A literal decoded when there was nowhere to put it. Placing it before
+                // reading anything else is what keeps the stream in order.
+                if let literal = self.heldLiteral {
+                    guard !self.destinationFull else { return false }
+
+                    self.emit(literal)
+                    self.heldLiteral = nil
+                    continue
+                }
+
                 switch try table.decode(&self.reader, partial: &self.symbolPartial) {
                 case .needsInput:
                     return false
 
                 case let .symbol(symbol):
                     if symbol < 256 {
+                        // Decoded before the room for it was checked, deliberately: the symbol
+                        // might have been end-of-block, and a stream whose last block is empty
+                        // has to be able to end on a destination with no room left at all.
+                        guard !self.destinationFull else {
+                            self.heldLiteral = UInt8(symbol)
+                            return false
+                        }
+
                         self.emit(UInt8(symbol))
                         continue
                     }
@@ -352,8 +382,6 @@ public final class Inflate {
                     return true
                 }
             }
-
-            return true
 
         case .matchExtraLength:
             let index = Int(self.pendingSymbol) - 257
@@ -412,10 +440,12 @@ public final class Inflate {
                 self.matchLength -= 1
             }
 
-            if self.matchLength == 0 {
-                self.state = .blockData
+            guard self.matchLength == 0 else {
+                // Match unfinished, so the loop above ended on a full destination.
+                return false
             }
 
+            self.state = .blockData
             return true
 
         case .done:
