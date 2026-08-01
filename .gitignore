@@ -63,3 +63,6 @@ fastlane/test_output
 
 # CMake build tree, and the export control regenerated into it
 build/
+
+# Python bytecode from the generator scripts
+__pycache__/
