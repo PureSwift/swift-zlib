@@ -21,6 +21,11 @@ let package = Package(
     products: [
         .library(name: "Zlib", targets: ["Zlib"]),
         .library(name: "LZ77", targets: ["LZ77"]),
+
+        // For iterating on the C surface locally. The artifact that gets installed is built by
+        // CMakeLists.txt instead, because the soname, the install name and the version script
+        // that make substitution work are not expressible here.
+        .library(name: "z", type: .dynamic, targets: ["ZlibABI"]),
     ],
     targets: [
         // RFC 1951. Self-contained, and what everything else here is built on.
@@ -34,6 +39,22 @@ let package = Package(
             name: "Zlib",
             dependencies: ["LZ77"],
             path: "Sources/Zlib"
+        ),
+
+        // The published C API as clients see it, plus the parts of the implementation that
+        // have to be C: reporting an unimplemented entry point, and the variadics.
+        .target(
+            name: "CZlib",
+            path: "Sources/CZlib",
+            publicHeadersPath: "include"
+        ),
+
+        // One @c function per implemented entry point, bound to the declaration in the
+        // vendored header. Nothing here decides anything about compression.
+        .target(
+            name: "ZlibABI",
+            dependencies: ["CZlib", "Zlib"],
+            path: "Sources/ZlibABI"
         ),
 
         .testTarget(
