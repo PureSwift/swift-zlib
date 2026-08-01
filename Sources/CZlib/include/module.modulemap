@@ -1,0 +1,8 @@
+// The published C API, imported so that every `@c @implementation` function below can be
+// type-checked against the declaration clients were compiled against. The headers are vendored
+// verbatim from the reference distribution and are not edited — an edit here would silently
+// move the contract this library claims to satisfy.
+module CZlib {
+    header "czlib_shim.h"
+    export *
+}
