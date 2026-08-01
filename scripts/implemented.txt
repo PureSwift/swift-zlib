@@ -1,0 +1,30 @@
+# Symbols implemented in Swift, in Sources/ZlibABI.
+#
+# A name here must NOT also be generated as a stub, and the linker enforces that: two
+# definitions of the same symbol is a link error, so the two files cannot drift apart.
+# Moving a name here is the last step of implementing it.
+
+# Checksums, in ChecksumAPI.swift.
+adler32
+adler32_z
+adler32_combine
+adler32_combine64
+crc32
+crc32_z
+crc32_combine
+crc32_combine64
+crc32_combine_gen
+crc32_combine_gen64
+crc32_combine_op
+
+# One-shot buffer to buffer, in UtilityAPI.swift.
+compress
+compress2
+compressBound
+uncompress
+uncompress2
+
+# Identity, in Version.swift.
+zlibVersion
+zError
+zlibCompileFlags
