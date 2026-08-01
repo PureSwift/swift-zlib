@@ -45,8 +45,6 @@ public final class Decompressor {
         into destination: UnsafeMutablePointer<UInt8>,
         count: Int
     ) throws(DeflateError) -> Int {
-        guard count > 0 else { return 0 }
-
         var produced = 0
 
         loop: while true {
@@ -57,8 +55,9 @@ public final class Decompressor {
                 self.state = .data
 
             case .data:
-                guard produced < count else { break loop }
-
+                // Called even with no room left, because a stream can still reach its end
+                // without producing anything — and a caller decompressing into a zero-length
+                // buffer is asking exactly whether it does.
                 let made = try self.stream.inflate(
                     into: destination + produced,
                     count: count - produced
