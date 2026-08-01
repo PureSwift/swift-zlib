@@ -8,14 +8,14 @@
 // member. A stream needing one of those wrappers is this stream with framing around it, and
 // framing is the wrapping module's business; see the `Zlib` module for the RFC 1950 case.
 //
-// What this produces is fixed-Huffman blocks (RFC 1951 §3.2.6) over LZ77 matches found with a
-// hash chain. That is a deliberate stopping point rather than a stub: fixed blocks need no
-// table sent and no tree built, which is most of the code and nearly all of the memory a
-// dynamic-block encoder wants, and on the targets this module exists to serve — a WASM sandbox
-// or a microcontroller with tens of kilobytes to spare — that trade is the right way round. The
-// output is a valid zlib stream that any decoder reads; it is simply a few per cent larger than
-// what zlib's dynamic blocks would emit at the same effort setting. Adding dynamic blocks later
-// changes only what this file emits, not what anything else here assumes.
+// Blocks are either stored (§3.2.4) or fixed-Huffman (§3.2.6) over LZ77 matches found with a
+// hash chain, whichever is smaller for the block at hand. Dynamic blocks are the deliberate
+// omission: they need a table built and sent, which is most of the code and nearly all of the
+// memory a full encoder wants, and on the targets this module exists to serve — a WASM sandbox,
+// a microcontroller — that trade is the right way round. The output is a valid DEFLATE stream
+// that any decoder reads; it is simply a few per cent larger than what a dynamic-block encoder
+// would emit. Adding them later changes only what this file writes, not what anything else
+// here assumes.
 //
 // Matching is the standard hash-chain arrangement: a rolling three-byte hash indexes the most
 // recent position with that hash, each of which links to the previous one, so the search walks
@@ -47,7 +47,7 @@ public final class Deflate {
 
     /// Everything handed in but not yet compressed, plus the window of already-compressed bytes
     /// a match may still reach back into. Trimmed from the front once the history behind the
-    /// cursor grows past what a distance can address.
+    /// cursor grows past what a distance can address and past what the open block still needs.
     private var pending: [UInt8] = []
     private var cursor = 0
 
@@ -63,9 +63,39 @@ public final class Deflate {
 
     private var writer = BitWriter()
 
-    private var startedBlock = false
+    // -- the block being built --------------------------------------------------
+    //
+    // Symbols are collected rather than written as they are found, because which kind of block
+    // to write cannot be known until the block is complete: a stored block costs its bytes plus
+    // five, and fixed-Huffman costs whatever its symbols add up to, and for incompressible input
+    // the first is smaller. Encoding straight out would commit to that answer before there was
+    // anything to base it on — and the wrong answer is not merely larger but *larger than the
+    // input*, which no caller sizing a buffer from `compressBound` is expecting.
 
-    /// Whether the stream's last block and checksum have been written into the pending output.
+    /// One entry per symbol: bit 31 clear for a literal in the low byte, bit 31 set for a match
+    /// with its length in bits 0...8 and its distance in bits 9...24.
+    ///
+    /// Packed into a word rather than an enum because there is one of these per literal byte,
+    /// and the array is the encoder's largest allocation.
+    private var symbols: [UInt32] = []
+
+    /// Where in `pending` the open block's uncompressed bytes start, which is what a stored
+    /// block writes out and therefore what cannot be trimmed away while the block is open.
+    private var blockStart = 0
+
+    /// What the open block's symbols would cost as fixed Huffman, in bits, accumulated as they
+    /// are appended so that closing the block is a comparison rather than a second pass.
+    private var blockCostBits = 0
+
+    /// A stored block's length is a sixteen-bit field, so a block that might become one cannot
+    /// cover more input than that.
+    private static let maxBlockBytes = 65535
+
+    /// A cap on the symbol buffer, so a block of highly compressible input closes on a bound
+    /// this module chose rather than on whatever `maxBlockBytes` happens to allow.
+    private static let maxBlockSymbols = 16384
+
+    /// Whether the stream's final block has been written into the pending output.
     ///
     /// Not yet the caller-visible "finished": that waits until the pending output has actually
     /// been handed over, because a caller told "finished" stops asking for bytes.
@@ -121,8 +151,21 @@ public final class Deflate {
         let keepBack = ending == .none ? Self.maxMatch : 0
         self.compressAvailable(keepingBack: keepBack)
 
-        if ending == .finish, !self.streamEnded, self.cursor >= self.pending.count {
-            self.finishStream()
+        if self.cursor >= self.pending.count {
+            switch ending {
+            case .none:
+                break
+
+            case .flush:
+                self.flushBlock(final: false)
+                self.writeSyncMarker()
+
+            case .finish:
+                if !self.streamEnded {
+                    self.flushBlock(final: true)
+                    self.streamEnded = true
+                }
+            }
         }
 
         return self.drain(into: destination, count: count)
@@ -139,40 +182,6 @@ public final class Deflate {
         self.pending.append(contentsOf: slice)
         self.chain.append(contentsOf: [Int](repeating: -1, count: slice.count))
         self.inputOffset = self.input.count
-    }
-
-    private func startBlockIfNeeded() {
-        guard !self.startedBlock else { return }
-
-        // BFINAL 0, BTYPE 01: not the last block, fixed Huffman codes. The stream is ended by
-        // an empty final block instead, so that finishing never depends on knowing in advance
-        // which block will turn out to be last.
-        self.writer.write(0, bits: 1)
-        self.writer.write(1, bits: 2)
-        self.startedBlock = true
-    }
-
-    private func endBlockIfStarted() {
-        guard self.startedBlock else { return }
-
-        self.writeLiteralOrLength(DeflateTables.endOfBlock)
-        self.startedBlock = false
-    }
-
-    private func finishStream() {
-        self.endBlockIfStarted()
-
-        // An empty final fixed block: BFINAL 1, BTYPE 01, then end-of-block immediately.
-        self.writer.write(1, bits: 1)
-        self.writer.write(1, bits: 2)
-        self.writeLiteralOrLength(DeflateTables.endOfBlock)
-
-        // Pad to a byte boundary. RFC 1951 does not require it of DEFLATE data on its own, but
-        // every wrapper that carries this stream puts a byte-aligned field after it, and a
-        // decoder aligning to find that field expects the padding to already be here.
-        self.writer.alignToByte()
-
-        self.streamEnded = true
     }
 
     private func drain(into destination: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
@@ -256,19 +265,12 @@ public final class Deflate {
     }
 
     private func compressAvailable(keepingBack keepBack: Int) {
-        guard self.effort.maxChainLength > 0 else {
-            self.emitLiteralsOnly(keepingBack: keepBack)
-            return
-        }
-
         let limit = self.pending.count
 
         while self.cursor + keepBack < limit {
-            self.startBlockIfNeeded()
-
-            if let match = self.longestMatch(at: self.cursor, limit: limit),
-               match.length >= Self.minMatch {
-                self.writeMatch(length: match.length, distance: match.distance)
+            if self.effort.maxChainLength > 0,
+               let match = self.longestMatch(at: self.cursor, limit: limit) {
+                self.appendMatch(length: match.length, distance: match.distance)
 
                 for offset in 0 ..< match.length {
                     self.insert(at: self.cursor + offset)
@@ -276,25 +278,26 @@ public final class Deflate {
 
                 self.cursor += match.length
             } else {
-                self.writeLiteralOrLength(UInt16(self.pending[self.cursor]))
-                self.insert(at: self.cursor)
+                self.appendLiteral(self.pending[self.cursor])
+
+                if self.effort.maxChainLength > 0 {
+                    self.insert(at: self.cursor)
+                }
+
                 self.cursor += 1
+            }
+
+            if self.blockIsFull {
+                self.flushBlock(final: false)
             }
         }
 
         self.trimWindow()
     }
 
-    private func emitLiteralsOnly(keepingBack keepBack: Int) {
-        let limit = self.pending.count
-
-        while self.cursor + keepBack < limit {
-            self.startBlockIfNeeded()
-            self.writeLiteralOrLength(UInt16(self.pending[self.cursor]))
-            self.cursor += 1
-        }
-
-        self.trimWindow()
+    private var blockIsFull: Bool {
+        self.cursor - self.blockStart >= Self.maxBlockBytes
+            || self.symbols.count >= Self.maxBlockSymbols
     }
 
     /// Drops history no match can reach any more, so `pending` does not grow with the stream.
@@ -302,10 +305,15 @@ public final class Deflate {
         let keep = DeflateTables.windowSize
         guard self.cursor > keep * 2 else { return }
 
-        let drop = self.cursor - keep
+        // Never drop what the open block has not been written out of: if it closes as a stored
+        // block, those bytes are what it writes.
+        let drop = min(self.cursor - keep, self.blockStart)
+        guard drop > 0 else { return }
+
         self.pending.removeFirst(drop)
         self.chain.removeFirst(drop)
         self.cursor -= drop
+        self.blockStart -= drop
 
         for index in 0 ..< self.head.count {
             self.head[index] = self.head[index] >= drop ? self.head[index] - drop : -1
@@ -314,6 +322,133 @@ public final class Deflate {
         for index in 0 ..< self.chain.count {
             self.chain[index] = self.chain[index] >= drop ? self.chain[index] - drop : -1
         }
+    }
+
+    // -- collecting a block's symbols --------------------------------------------
+
+    private func appendLiteral(_ byte: UInt8) {
+        self.symbols.append(UInt32(byte))
+        self.blockCostBits += Self.literalOrLengthBits(UInt16(byte))
+    }
+
+    private func appendMatch(length: Int, distance: Int) {
+        self.symbols.append(
+            0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
+        )
+
+        let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
+        let distanceSymbol = Self.distanceSymbol(for: distance)
+
+        self.blockCostBits +=
+            Self.literalOrLengthBits(UInt16(257 + lengthSymbol))
+            + DeflateTables.lengthExtraBits[lengthSymbol]
+            + 5
+            + DeflateTables.distanceExtraBits[distanceSymbol]
+    }
+
+    private static func distanceSymbol(for distance: Int) -> Int {
+        var symbol = DeflateTables.distanceBase.count - 1
+
+        while DeflateTables.distanceBase[symbol] > distance {
+            symbol -= 1
+        }
+
+        return symbol
+    }
+
+    /// §3.2.6: how many bits the fixed alphabet spends on one literal/length symbol.
+    private static func literalOrLengthBits(_ symbol: UInt16) -> Int {
+        switch symbol {
+        case 0 ... 143: return 8
+        case 144 ... 255: return 9
+        case 256 ... 279: return 7
+        default: return 8
+        }
+    }
+
+    // -- closing a block ---------------------------------------------------------
+
+    /// Writes the open block out in whichever form is smaller, and starts a new one.
+    ///
+    /// A block is always written, even with nothing in it: that is how a stream with no input
+    /// at all still ends with a final block, and how `.flush` produces something a reader can
+    /// act on rather than nothing at all.
+    private func flushBlock(final: Bool) {
+        let storedLength = self.cursor - self.blockStart
+
+        // Fixed costs three bits of header and seven for end-of-block on top of its symbols.
+        // Stored costs three of header, up to seven of padding to reach a byte boundary, and
+        // then four bytes of length and complement before the data itself.
+        let fixedBits = 3 + self.blockCostBits + 7
+        let storedBits = 3 + 7 + 32 + storedLength * 8
+
+        if storedLength <= Self.maxBlockBytes, storedBits < fixedBits {
+            self.writeStoredBlock(final: final, length: storedLength)
+        } else {
+            self.writeFixedBlock(final: final)
+        }
+
+        if final {
+            // The stream's bits end wherever the last code did, but everything that carries a
+            // DEFLATE stream puts a byte-aligned field after it, and a partial byte left in the
+            // writer would never reach the output at all.
+            self.writer.alignToByte()
+        }
+
+        self.symbols.removeAll(keepingCapacity: true)
+        self.blockCostBits = 0
+        self.blockStart = self.cursor
+    }
+
+    /// An empty stored block, which is how a stream reaches a byte boundary mid-flight.
+    ///
+    /// Padding to a boundary directly would not do: the next block's header has to begin at the
+    /// very next bit, so there is nowhere legal to put the padding. An empty stored block has
+    /// the alignment built into its own format, and its five bytes — `00 00 00 FF FF` — are
+    /// what every other implementation emits for a sync flush, so a reader expecting one finds
+    /// exactly that.
+    private func writeSyncMarker() {
+        self.writer.write(0, bits: 1)
+        self.writer.write(0, bits: 2)
+        self.writer.alignToByte()
+        self.writer.write(0, bits: 16)
+        self.writer.write(0xFFFF, bits: 16)
+    }
+
+    private func writeStoredBlock(final: Bool, length: Int) {
+        // §3.2.4: BTYPE 00, then the rest of the byte discarded, then LEN and its one's
+        // complement, then the bytes themselves verbatim.
+        self.writer.write(final ? 1 : 0, bits: 1)
+        self.writer.write(0, bits: 2)
+        self.writer.alignToByte()
+
+        self.writer.write(UInt32(length), bits: 16)
+        self.writer.write(UInt32(length ^ 0xFFFF), bits: 16)
+
+        self.pending.withUnsafeBufferPointer { buffer in
+            self.writer.append(
+                UnsafeBufferPointer(start: buffer.baseAddress! + self.blockStart, count: length)
+            )
+        }
+    }
+
+    private func writeFixedBlock(final: Bool) {
+        self.writer.write(final ? 1 : 0, bits: 1)
+        self.writer.write(1, bits: 2)
+
+        for symbol in self.symbols {
+            guard symbol & 0x8000_0000 != 0 else {
+                self.writeLiteralOrLength(UInt16(truncatingIfNeeded: symbol))
+                continue
+            }
+
+            self.writeMatch(
+                length: Int(symbol & 0x1FF),
+                distance: Int((symbol >> 9) & 0xFFFF)
+            )
+        }
+
+        self.writeLiteralOrLength(DeflateTables.endOfBlock)
     }
 
     // -- fixed-Huffman symbol emission ------------------------------------------
@@ -334,13 +469,7 @@ public final class Deflate {
     }
 
     private func writeMatch(length: Int, distance: Int) {
-        var lengthSymbol = 0
-
-        for index in stride(from: DeflateTables.lengthBase.count - 1, through: 0, by: -1)
-        where DeflateTables.lengthBase[index] <= length {
-            lengthSymbol = index
-            break
-        }
+        let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
 
         self.writeLiteralOrLength(UInt16(257 + lengthSymbol))
 
@@ -352,13 +481,7 @@ public final class Deflate {
             )
         }
 
-        var distanceSymbol = 0
-
-        for index in stride(from: DeflateTables.distanceBase.count - 1, through: 0, by: -1)
-        where DeflateTables.distanceBase[index] <= distance {
-            distanceSymbol = index
-            break
-        }
+        let distanceSymbol = Self.distanceSymbol(for: distance)
 
         // Distance codes are five bits each in the fixed alphabet, written most significant bit
         // first like any other code.
