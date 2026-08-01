@@ -87,8 +87,51 @@ Those differential runs are not yet in the repository. `swift test` runs the uni
 which check the decoder against known-good streams, the encoder by round trip, and the
 framing by direct assertion.
 
-Not yet here: a C ABI surface, so that a program built against libz could load this unchanged.
+## The C ABI
+
+`cmake --build` produces a `libz.so.1` that a program compiled against the reference can load
+unchanged. The Swift engine knows nothing about it: `ZlibABI` is a separate target holding one
+`@c @implementation` function per entry point, each type-checked against the declaration in the
+vendored `zlib.h`, so the exported ABI cannot drift from what clients were compiled against.
+
+```
+cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
+./scripts/check_exports.sh          # exactly the reference's 88 symbols, right version nodes
+./scripts/run_conformance.sh        # differential test against the system libz
+```
+
+**All 88 symbols are exported; 19 are implemented.** The rest are generated stubs that report
+the gap on stderr and return the library's own error value, so a client gets a diagnostic
+rather than a link failure — and so each one becomes "move a name from `scripts/implemented.txt`
+and watch the conformance diff shrink". A name in both files is a duplicate-symbol link error,
+so the two cannot drift.
+
+Implemented: the checksums (`adler32`, `crc32`, both `_z` and every `_combine` variant),
+`compress`/`compress2`/`uncompress`/`uncompress2`/`compressBound`, and
+`zlibVersion`/`zError`/`zlibCompileFlags`. Not yet: the `z_stream` streaming API, and the whole
+`gz*` file layer.
+
+Two build systems on purpose. SwiftPM drives development and the tests; CMake builds the
+shipped artifact, because the soname, the install name and the version script are not
+expressible in `Package.swift`.
+
+### What is verified
+
+- The built library exports **exactly** the reference's 88 symbols under the reference's own
+  version nodes — nothing missing, and none of the ~190 Swift symbols a naive link leaks.
+- `Conformance/zconform.c` compiled twice, against the reference and against this library, is
+  **identical on every compared line**: every checksum, every running and combined checksum,
+  every return code, every error path.
+- A binary compiled and linked against the real libz produces byte-identical output when run
+  with this library `LD_PRELOAD`ed.
+
+Compressed *sizes* are the one thing allowed to differ, since nothing requires two encoders to
+agree. `run_conformance.sh` reports them as a table: equal or better on incompressible and
+small inputs, and 2–6× larger on highly compressible input, which is the dynamic-block gap
+above.
 
 ## License
 
 MIT. See `LICENSE`.
+
+The vendored `zlib.h` and `zconf.h` are under the zlib licence instead — see `LICENSE.zlib`.
