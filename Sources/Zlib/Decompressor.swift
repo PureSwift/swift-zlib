@@ -22,7 +22,7 @@ public final class Decompressor {
 
     private var state: State = .header
     private let stream = Inflate()
-    private var checksum = Adler32()
+    private var checksumState = Adler32()
 
     /// Whether the stream has ended *and* its checksum has been read and matched.
     ///
@@ -38,6 +38,17 @@ public final class Decompressor {
 
     public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         self.stream.setInput(bytes)
+    }
+
+    /// The Adler-32 of everything produced so far.
+    public var checksum: UInt32 {
+        self.checksumState.value
+    }
+
+    /// How many bytes of the buffer last handed to ``setInput(_:)`` this stream has taken —
+    /// see ``LZ77/Inflate/pulledInputCount``, whose exactness this inherits.
+    public var pulledInputCount: Int {
+        self.stream.pulledInputCount
     }
 
     /// Decompresses into `destination`, returning how many bytes were produced.
@@ -67,7 +78,7 @@ public final class Decompressor {
                     // Checksummed from the caller's buffer rather than as each byte is produced:
                     // the trailer covers the output in full, and folding it in a block at a time
                     // is what keeps Adler-32 a few adds per byte.
-                    self.checksum.update(
+                    self.checksumState.update(
                         UnsafeBufferPointer(start: destination + produced, count: made)
                     )
                     produced += made
@@ -99,7 +110,7 @@ public final class Decompressor {
                     | (((raw >> 16) & 0xFF) << 8)
                     | ((raw >> 24) & 0xFF)
 
-                guard stored == self.checksum.value else {
+                guard stored == self.checksumState.value else {
                     throw DeflateError("Adler-32 checksum mismatch")
                 }
 
