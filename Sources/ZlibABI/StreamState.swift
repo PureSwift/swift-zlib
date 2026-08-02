@@ -22,8 +22,11 @@ import CZlib
 enum Wrapper {
     case zlib
     case raw
-    /// Requested but not built: gzip framing, and the auto-detecting mode that accepts either.
-    case unsupported
+    case gzip
+    /// Whichever of zlib and gzip the stream turns out to be, decided from its first byte.
+    ///
+    /// Only meaningful for inflate: an encoder cannot detect what it has not been told.
+    case detect
 
     /// - Parameter windowBits: as `inflateInit2_` and `deflateInit2_` define it — 8...15 for
     ///   zlib, negative for raw, +16 for gzip, +32 for detect-either.
@@ -42,8 +45,10 @@ enum Wrapper {
             return (.raw, -windowBits)
         case -8:
             return (.raw, 9)
-        case 24 ... 31, 40 ... 47:
-            return (.unsupported, 15)
+        case 24 ... 31:
+            return (.gzip, max(9, windowBits - 16))
+        case 40 ... 47:
+            return (.detect, max(9, windowBits - 32))
         default:
             return nil
         }
