@@ -57,46 +57,34 @@ endif()
 message(STATUS "${gen_stubs_output}")
 
 # -- the engine ---------------------------------------------------------------
+#
+# Globbed rather than listed. The usual objection is that a new file does not trigger a
+# reconfigure, which CONFIGURE_DEPENDS answers; the reason to do it anyway is that SwiftPM takes
+# every file in the directory and this build has to produce the same modules from the same
+# sources. A hand-kept list here is a list that silently omits a file SwiftPM compiled, and the
+# result is not a build error but a shared object quietly missing part of its API.
 
-add_library(LZ77 STATIC
-    Sources/LZ77/BitReader.swift
-    Sources/LZ77/BitWriter.swift
-    Sources/LZ77/Deflate.swift
-    Sources/LZ77/DeflateError.swift
-    Sources/LZ77/DeflateTables.swift
-    Sources/LZ77/HuffmanTable.swift
-    Sources/LZ77/Inflate.swift
-)
+file(GLOB LZ77_SOURCES CONFIGURE_DEPENDS Sources/LZ77/*.swift)
+file(GLOB ZLIB_SOURCES CONFIGURE_DEPENDS Sources/Zlib/*.swift)
+file(GLOB ABI_SOURCES CONFIGURE_DEPENDS Sources/ZlibABI/*.swift)
+file(GLOB CZLIB_SOURCES CONFIGURE_DEPENDS Sources/CZlib/*.c Sources/CZlib/gen/*.c)
+
+add_library(LZ77 STATIC ${LZ77_SOURCES})
 target_compile_options(LZ77 PRIVATE -parse-as-library)
 
-add_library(SwiftZlib STATIC
-    Sources/Zlib/Adler32.swift
-    Sources/Zlib/Compressor.swift
-    Sources/Zlib/Crc32.swift
-    Sources/Zlib/Decompressor.swift
-    Sources/Zlib/DeflateError.swift
-)
+add_library(SwiftZlib STATIC ${ZLIB_SOURCES})
 set_target_properties(SwiftZlib PROPERTIES Swift_MODULE_NAME Zlib)
 target_compile_options(SwiftZlib PRIVATE -parse-as-library)
 target_link_libraries(SwiftZlib PUBLIC LZ77)
 
 # -- the C parts --------------------------------------------------------------
 
-add_library(CZlib STATIC
-    Sources/CZlib/zlib_diagnostics.c
-    Sources/CZlib/zlib_variadic.c
-    Sources/CZlib/gen/zlib_stubs.c
-)
+add_library(CZlib STATIC ${CZLIB_SOURCES})
 target_include_directories(CZlib PUBLIC Sources/CZlib/include)
 
 # -- the boundary -------------------------------------------------------------
 
-add_library(ZlibABI STATIC
-    Sources/ZlibABI/Boundary.swift
-    Sources/ZlibABI/ChecksumAPI.swift
-    Sources/ZlibABI/UtilityAPI.swift
-    Sources/ZlibABI/Version.swift
-)
+add_library(ZlibABI STATIC ${ABI_SOURCES})
 target_compile_options(ZlibABI PRIVATE
     -parse-as-library
     -Xcc -I${CMAKE_SOURCE_DIR}/Sources/CZlib/include
