@@ -6,12 +6,14 @@
 // `flush`, which is the caller asking for output it can act on before the stream is over.
 
 import CZlib
+import GZip
 import LZ77
 import Zlib
 
 final class DeflateStream {
     enum Engine {
-        case zlib(Compressor)
+        case zlib(Zlib.Compressor)
+        case gzip(GZip.Compressor)
         case raw(Deflate)
     }
 
@@ -27,21 +29,35 @@ final class DeflateStream {
         self.level = level
         self.wrapper = wrapper
         self.windowBits = windowBits
-        self.engine = wrapper == .raw
-            ? .raw(Deflate(level: level, windowBits: windowBits))
-            : .zlib(Compressor(level: level, windowBits: windowBits))
+        self.engine = Self.engine(level: level, wrapper: wrapper, windowBits: windowBits)
     }
 
     func reset() {
-        self.engine = self.wrapper == .raw
-            ? .raw(Deflate(level: self.level, windowBits: self.windowBits))
-            : .zlib(Compressor(level: self.level, windowBits: self.windowBits))
+        self.engine = Self.engine(
+            level: self.level,
+            wrapper: self.wrapper,
+            windowBits: self.windowBits
+        )
         self.ended = false
+    }
+
+    private static func engine(level: Int32, wrapper: Wrapper, windowBits: Int32) -> Engine {
+        switch wrapper {
+        case .gzip:
+            return .gzip(GZip.Compressor(level: level, windowBits: windowBits))
+        case .raw:
+            return .raw(Deflate(level: level, windowBits: windowBits))
+        // An encoder has nothing to detect, so `.detect` never reaches here: deflateInit2_
+        // refuses it, as the reference does.
+        case .zlib, .detect:
+            return .zlib(Zlib.Compressor(level: level, windowBits: windowBits))
+        }
     }
 
     var isFinished: Bool {
         switch self.engine {
         case let .zlib(stream): return stream.isFinished
+        case let .gzip(stream): return stream.isFinished
         case let .raw(stream): return stream.isFinished
         }
     }
@@ -49,6 +65,7 @@ final class DeflateStream {
     var needsInput: Bool {
         switch self.engine {
         case let .zlib(stream): return stream.needsInput
+        case let .gzip(stream): return stream.needsInput
         case let .raw(stream): return stream.needsInput
         }
     }
@@ -56,6 +73,7 @@ final class DeflateStream {
     var checksum: UInt32? {
         switch self.engine {
         case let .zlib(stream): return stream.checksum
+        case let .gzip(stream): return stream.checksum
         case .raw: return nil
         }
     }
@@ -63,6 +81,7 @@ final class DeflateStream {
     func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         switch self.engine {
         case let .zlib(stream): stream.setInput(bytes)
+        case let .gzip(stream): stream.setInput(bytes)
         case let .raw(stream): stream.setInput(bytes)
         }
     }
@@ -74,6 +93,8 @@ final class DeflateStream {
     ) throws(DeflateError) -> Int {
         switch self.engine {
         case let .zlib(stream):
+            return try stream.deflate(into: destination, count: count, ending: ending)
+        case let .gzip(stream):
             return try stream.deflate(into: destination, count: count, ending: ending)
         case let .raw(stream):
             return try stream.deflate(into: destination, count: count, ending: ending)
@@ -110,13 +131,12 @@ public func deflateInit2_(
     guard memLevel >= 1, memLevel <= 9 else { return Status.streamError }
     guard strategy >= 0, strategy <= 4 else { return Status.streamError }
 
-    guard let (wrapper, bits) = Wrapper.forWindowBits(windowBits), windowBits != 0 else {
-        return Status.streamError
-    }
-
-    guard wrapper != .unsupported else {
-        swiftzlib_report_unimplemented("deflateInit2_ with gzip window bits")
-        setMessage(strm, zError(Status.streamError))
+    // `windowBits == 0` means "read it from the header", which only a decoder can do, and
+    // `.detect` likewise asks an encoder to discover something only a decoder can.
+    guard let (wrapper, bits) = Wrapper.forWindowBits(windowBits),
+          windowBits != 0,
+          wrapper != .detect
+    else {
         return Status.streamError
     }
 
@@ -265,12 +285,17 @@ public func deflateBound(_ strm: z_streamp!, _ sourceLen: UInt) -> UInt {
         &+ ((sourceLen &+ 63) >> 6)
         &+ 5
 
-    // The wrapper's own bytes on top: six for zlib's header and trailer, none for raw.
+    // The wrapper's own bytes on top: six for zlib, eighteen for gzip's longer header and its
+    // second trailer field, none for raw.
     guard let strm, let state = attached(strm, as: DeflateStream.self) else {
-        return base &+ 6
+        return base &+ 18
     }
 
-    return state.wrapper == .raw ? base : base &+ 6
+    switch state.wrapper {
+    case .raw: return base
+    case .gzip: return base &+ 18
+    case .zlib, .detect: return base &+ 6
+    }
 }
 
 /// How much output is generated but not yet handed over.
