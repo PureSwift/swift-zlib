@@ -7,27 +7,9 @@
 
 #include "czlib_shim.h"
 
-#undef deflate
-int deflate(z_streamp strm, int flush) {
-    swiftzlib_report_unimplemented("deflate");
-    return Z_STREAM_ERROR;
-}
-
-#undef deflateBound
-uLong deflateBound(z_streamp strm, uLong sourceLen) {
-    swiftzlib_report_unimplemented("deflateBound");
-    return 0;
-}
-
 #undef deflateCopy
 int deflateCopy(z_streamp dest, z_streamp source) {
     swiftzlib_report_unimplemented("deflateCopy");
-    return Z_STREAM_ERROR;
-}
-
-#undef deflateEnd
-int deflateEnd(z_streamp strm) {
-    swiftzlib_report_unimplemented("deflateEnd");
     return Z_STREAM_ERROR;
 }
 
@@ -37,45 +19,15 @@ int deflateGetDictionary(z_streamp strm, Bytef *dictionary, uInt *dictLength) {
     return Z_STREAM_ERROR;
 }
 
-#undef deflateInit2_
-int deflateInit2_(z_streamp strm, int level, int method, int windowBits, int memLevel, int strategy, const char *version, int stream_size) {
-    swiftzlib_report_unimplemented("deflateInit2_");
-    return Z_STREAM_ERROR;
-}
-
-#undef deflateInit_
-int deflateInit_(z_streamp strm, int level, const char *version, int stream_size) {
-    swiftzlib_report_unimplemented("deflateInit_");
-    return Z_STREAM_ERROR;
-}
-
 #undef deflateParams
 int deflateParams(z_streamp strm, int level, int strategy) {
     swiftzlib_report_unimplemented("deflateParams");
     return Z_STREAM_ERROR;
 }
 
-#undef deflatePending
-int deflatePending(z_streamp strm, unsigned *pending, int *bits) {
-    swiftzlib_report_unimplemented("deflatePending");
-    return Z_STREAM_ERROR;
-}
-
 #undef deflatePrime
 int deflatePrime(z_streamp strm, int bits, int value) {
     swiftzlib_report_unimplemented("deflatePrime");
-    return Z_STREAM_ERROR;
-}
-
-#undef deflateReset
-int deflateReset(z_streamp strm) {
-    swiftzlib_report_unimplemented("deflateReset");
-    return Z_STREAM_ERROR;
-}
-
-#undef deflateResetKeep
-int deflateResetKeep(z_streamp p0) {
-    swiftzlib_report_unimplemented("deflateResetKeep");
     return Z_STREAM_ERROR;
 }
 
@@ -283,12 +235,6 @@ int gzwrite(gzFile file, voidpc buf, unsigned len) {
     return Z_STREAM_ERROR;
 }
 
-#undef inflate
-int inflate(z_streamp strm, int flush) {
-    swiftzlib_report_unimplemented("inflate");
-    return Z_STREAM_ERROR;
-}
-
 #undef inflateBack
 int inflateBack(z_streamp strm, in_func in, void FAR *in_desc, out_func out, void FAR *out_desc) {
     swiftzlib_report_unimplemented("inflateBack");
@@ -319,12 +265,6 @@ int inflateCopy(z_streamp dest, z_streamp source) {
     return Z_STREAM_ERROR;
 }
 
-#undef inflateEnd
-int inflateEnd(z_streamp strm) {
-    swiftzlib_report_unimplemented("inflateEnd");
-    return Z_STREAM_ERROR;
-}
-
 #undef inflateGetDictionary
 int inflateGetDictionary(z_streamp strm, Bytef *dictionary, uInt *dictLength) {
     swiftzlib_report_unimplemented("inflateGetDictionary");
@@ -337,18 +277,6 @@ int inflateGetHeader(z_streamp strm, gz_headerp head) {
     return Z_STREAM_ERROR;
 }
 
-#undef inflateInit2_
-int inflateInit2_(z_streamp strm, int windowBits, const char *version, int stream_size) {
-    swiftzlib_report_unimplemented("inflateInit2_");
-    return Z_STREAM_ERROR;
-}
-
-#undef inflateInit_
-int inflateInit_(z_streamp strm, const char *version, int stream_size) {
-    swiftzlib_report_unimplemented("inflateInit_");
-    return Z_STREAM_ERROR;
-}
-
 #undef inflateMark
 long inflateMark(z_streamp strm) {
     swiftzlib_report_unimplemented("inflateMark");
@@ -358,24 +286,6 @@ long inflateMark(z_streamp strm) {
 #undef inflatePrime
 int inflatePrime(z_streamp strm, int bits, int value) {
     swiftzlib_report_unimplemented("inflatePrime");
-    return Z_STREAM_ERROR;
-}
-
-#undef inflateReset
-int inflateReset(z_streamp strm) {
-    swiftzlib_report_unimplemented("inflateReset");
-    return Z_STREAM_ERROR;
-}
-
-#undef inflateReset2
-int inflateReset2(z_streamp strm, int windowBits) {
-    swiftzlib_report_unimplemented("inflateReset2");
-    return Z_STREAM_ERROR;
-}
-
-#undef inflateResetKeep
-int inflateResetKeep(z_streamp p0) {
-    swiftzlib_report_unimplemented("inflateResetKeep");
     return Z_STREAM_ERROR;
 }
 
