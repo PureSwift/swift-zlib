@@ -11,7 +11,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${1:-}"
 
 if [[ -z "$BUILD" ]]; then
-    BUILD="$(find "$ROOT/.build" -name 'libz.so*' -type f 2>/dev/null | head -1)"
+    # The newest, not the first found: debug and release builds sit side by side, and testing
+    # whichever the filesystem listed first means quietly testing a stale library and trusting
+    # the result.
+    BUILD="$(find "$ROOT/.build" -name 'libz.so*' -type f -printf '%T@ %p\n' 2>/dev/null |
+        sort -rn | head -1 | cut -d' ' -f2-)"
 fi
 
 if [[ ! -f "$BUILD" ]]; then
