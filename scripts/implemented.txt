@@ -47,3 +47,7 @@ deflateReset
 deflateResetKeep
 deflateBound
 deflatePending
+
+# gzip metadata, in HeaderAPI.swift.
+deflateSetHeader
+inflateGetHeader
