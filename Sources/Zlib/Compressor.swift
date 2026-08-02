@@ -16,7 +16,7 @@ public final class Compressor {
     public typealias Ending = Deflate.Ending
 
     private let stream: Deflate
-    private var checksum = Adler32()
+    private var checksumState = Adler32()
 
     /// Framing bytes waiting for room in a caller's buffer — the header before anything else has
     /// been written, the trailer after everything else has.
@@ -34,8 +34,19 @@ public final class Compressor {
         self.wroteTrailer && self.pendingOffset >= self.pending.count
     }
 
-    public init(level: Int32 = 6) {
-        self.stream = Deflate(level: level)
+    /// The window this stream declares in its header, which is also the limit the encoder
+    /// under it works to. Kept so the header can be built from it.
+    private let windowBits: Int32
+
+    /// - Parameter windowBits: the base-two logarithm of the window, 9 through 15.
+    public init(level: Int32 = 6, windowBits: Int32 = 15) {
+        self.windowBits = max(9, min(15, windowBits))
+        self.stream = Deflate(level: level, windowBits: self.windowBits)
+    }
+
+    /// The Adler-32 of everything handed in so far.
+    public var checksum: UInt32 {
+        self.checksumState.value
     }
 
     public var needsInput: Bool {
@@ -48,7 +59,7 @@ public final class Compressor {
     /// full: every byte handed over will be compressed before the stream can finish, so counting
     /// it now and counting it later differ only in when, never in what.
     public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
-        self.checksum.update(bytes)
+        self.checksumState.update(bytes)
         self.stream.setInput(bytes)
     }
 
@@ -61,7 +72,7 @@ public final class Compressor {
         guard count > 0 else { return 0 }
 
         if !self.wroteHeader {
-            self.pending = Self.header
+            self.pending = Self.header(windowBits: self.windowBits)
             self.pendingOffset = 0
             self.wroteHeader = true
         }
@@ -78,7 +89,7 @@ public final class Compressor {
         // The trailer goes in only once the DEFLATE data is complete *and* collected — `LZ77`'s
         // own `isFinished` already means both, so there is no risk of framing overtaking data.
         if self.stream.isFinished, !self.wroteTrailer {
-            self.pending = Self.trailer(for: self.checksum.value)
+            self.pending = Self.trailer(for: self.checksumState.value)
             self.pendingOffset = 0
             self.wroteTrailer = true
         }
@@ -113,10 +124,15 @@ public final class Compressor {
 
     // -- the framing itself ------------------------------------------------------
 
-    /// §2.2: CMF is deflate with a 32 KiB window; FLG carries no preset dictionary and a check
-    /// value chosen so the two bytes read as a big-endian number divisible by 31.
-    private static let header: [UInt8] = {
-        let cmf: UInt32 = 0x78
+    /// §2.2: CMF is the compression method in the low nibble and the window in the high one;
+    /// FLG carries no preset dictionary and a check value chosen so that the two bytes read as
+    /// a big-endian number divide by 31.
+    ///
+    /// The window recorded here is the one the encoder was actually held to, not a fixed 32 KiB:
+    /// a decoder sizes its own window from this byte, and telling it more than the encoder used
+    /// only wastes its memory while telling it less would be a lie it cannot survive.
+    private static func header(windowBits: Int32) -> [UInt8] {
+        let cmf = UInt32((windowBits - 8) << 4) | 8
         var flg: UInt32 = 0
 
         while (cmf * 256 + flg) % 31 != 0 {
@@ -124,7 +140,7 @@ public final class Compressor {
         }
 
         return [UInt8(cmf), UInt8(flg)]
-    }()
+    }
 
     /// §2.2: the Adler-32 of the uncompressed data, most significant byte first — the one field
     /// in either format that is big-endian, everything in DEFLATE below being the other way.
