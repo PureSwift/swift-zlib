@@ -37,12 +37,6 @@ int deflateSetDictionary(z_streamp strm, const Bytef *dictionary, uInt dictLengt
     return Z_STREAM_ERROR;
 }
 
-#undef deflateSetHeader
-int deflateSetHeader(z_streamp strm, gz_headerp head) {
-    swiftzlib_report_unimplemented("deflateSetHeader");
-    return Z_STREAM_ERROR;
-}
-
 #undef deflateTune
 int deflateTune(z_streamp strm, int good_length, int max_lazy, int nice_length, int max_chain) {
     swiftzlib_report_unimplemented("deflateTune");
@@ -268,12 +262,6 @@ int inflateCopy(z_streamp dest, z_streamp source) {
 #undef inflateGetDictionary
 int inflateGetDictionary(z_streamp strm, Bytef *dictionary, uInt *dictLength) {
     swiftzlib_report_unimplemented("inflateGetDictionary");
-    return Z_STREAM_ERROR;
-}
-
-#undef inflateGetHeader
-int inflateGetHeader(z_streamp strm, gz_headerp head) {
-    swiftzlib_report_unimplemented("inflateGetHeader");
     return Z_STREAM_ERROR;
 }
 
