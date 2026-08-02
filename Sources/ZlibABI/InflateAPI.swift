@@ -16,13 +16,18 @@
 // caller offers again and this layer skips again, and the stream stops dead.
 
 import CZlib
+import GZip
 import LZ77
 import Zlib
 
 final class InflateStream {
     enum Engine {
-        case zlib(Decompressor)
+        case zlib(Zlib.Decompressor)
+        case gzip(GZip.Decompressor)
         case raw(Inflate)
+        /// Nothing built yet, because which wrapper this is has not been decided. Resolved by
+        /// ``decide(from:)`` as soon as one byte of the stream is in hand.
+        case undecided
     }
 
     var engine: Engine
@@ -33,21 +38,53 @@ final class InflateStream {
     /// than a second attempt at a finished stream.
     var ended = false
 
+    /// A caller's `gz_header` waiting to be filled in, from `inflateGetHeader`. Cleared once
+    /// answered, so a header is reported once rather than rewritten on every call.
+    var headerRequest: gz_headerp?
+
     init(wrapper: Wrapper, windowBits: Int32) {
         self.wrapper = wrapper
         self.windowBits = windowBits
-        self.engine = wrapper == .raw ? .raw(Inflate()) : .zlib(Decompressor())
+        self.engine = Self.engine(for: wrapper)
     }
 
     func reset() {
-        self.engine = self.wrapper == .raw ? .raw(Inflate()) : .zlib(Decompressor())
+        self.engine = Self.engine(for: self.wrapper)
         self.ended = false
+    }
+
+    private static func engine(for wrapper: Wrapper) -> Engine {
+        switch wrapper {
+        case .zlib: return .zlib(Zlib.Decompressor())
+        case .gzip: return .gzip(GZip.Decompressor())
+        case .raw: return .raw(Inflate())
+        case .detect: return .undecided
+        }
+    }
+
+    /// Picks the wrapper from the stream's first byte.
+    ///
+    /// §2.3.1 gives a gzip member the fixed magic 0x1f, and RFC 1950 §2.2 puts the compression
+    /// method in the low nibble of the first byte, which for deflate makes it 0x?8. The two
+    /// cannot collide, so one byte decides it — which is why this waits for one rather than
+    /// guessing, and why a caller that has supplied nothing yet gets told to supply something.
+    func decide(from first: UInt8) {
+        self.engine = first == 0x1F
+            ? .gzip(GZip.Decompressor())
+            : .zlib(Zlib.Decompressor())
+    }
+
+    var isUndecided: Bool {
+        if case .undecided = self.engine { return true }
+        return false
     }
 
     var isFinished: Bool {
         switch self.engine {
         case let .zlib(stream): return stream.isFinished
+        case let .gzip(stream): return stream.isFinished
         case let .raw(stream): return stream.isFinished
+        case .undecided: return false
         }
     }
 
@@ -57,21 +94,26 @@ final class InflateStream {
     var checksum: UInt32? {
         switch self.engine {
         case let .zlib(stream): return stream.checksum
-        case .raw: return nil
+        case let .gzip(stream): return stream.checksum
+        case .raw, .undecided: return nil
         }
     }
 
     var pulledInputCount: Int {
         switch self.engine {
         case let .zlib(stream): return stream.pulledInputCount
+        case let .gzip(stream): return stream.pulledInputCount
         case let .raw(stream): return stream.pulledInputCount
+        case .undecided: return 0
         }
     }
 
     func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         switch self.engine {
         case let .zlib(stream): stream.setInput(bytes)
+        case let .gzip(stream): stream.setInput(bytes)
         case let .raw(stream): stream.setInput(bytes)
+        case .undecided: break
         }
     }
 
@@ -81,7 +123,9 @@ final class InflateStream {
     ) throws(DeflateError) -> Int {
         switch self.engine {
         case let .zlib(stream): return try stream.inflate(into: destination, count: count)
+        case let .gzip(stream): return try stream.inflate(into: destination, count: count)
         case let .raw(stream): return try stream.inflate(into: destination, count: count)
+        case .undecided: return 0
         }
     }
 }
@@ -106,14 +150,6 @@ public func inflateInit2_(
     guard let strm else { return Status.streamError }
 
     guard let (wrapper, bits) = Wrapper.forWindowBits(windowBits) else {
-        setMessage(strm, zError(Status.streamError))
-        return Status.streamError
-    }
-
-    guard wrapper != .unsupported else {
-        // Reported rather than silently decoded as zlib: gzip framing that is read as a zlib
-        // header produces a plausible-looking failure much later, or worse, does not fail.
-        swiftzlib_report_unimplemented("inflateInit2_ with gzip or automatic window bits")
         setMessage(strm, zError(Status.streamError))
         return Status.streamError
     }
@@ -143,6 +179,16 @@ public func inflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
 
     let available = Int(strm.pointee.avail_in)
 
+    if state.isUndecided {
+        guard available > 0, let next = strm.pointee.next_in else {
+            // Nothing to decide from yet. Not an error: the caller supplies a byte and asks
+            // again, which is exactly what Z_BUF_ERROR asks it to do.
+            return Status.bufferError
+        }
+
+        state.decide(from: next.pointee)
+    }
+
     if available > 0, let next = strm.pointee.next_in {
         state.setInput(UnsafeBufferPointer(start: next, count: available))
     } else {
@@ -164,6 +210,15 @@ public func inflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
         _ = consume(strm, state, produced: 0)
         setMessage(strm, zError(Status.dataError))
         return Status.dataError
+    }
+
+    // A gzip header becomes available partway through, well before the stream ends, and a
+    // caller that asked for it wants it as soon as it is there rather than at the end.
+    if let request = state.headerRequest,
+       case let .gzip(decompressor) = state.engine,
+       decompressor.headerIsComplete {
+        reportHeader(request, decompressor.header)
+        state.headerRequest = nil
     }
 
     let used = consume(strm, state, produced: produced)
@@ -260,7 +315,7 @@ public func inflateReset2(_ strm: z_streamp!, _ windowBits: Int32) -> Int32 {
         return Status.streamError
     }
 
-    guard let (wrapper, bits) = Wrapper.forWindowBits(windowBits), wrapper != .unsupported else {
+    guard let (wrapper, bits) = Wrapper.forWindowBits(windowBits) else {
         return Status.streamError
     }
 
