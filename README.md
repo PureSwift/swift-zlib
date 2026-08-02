@@ -10,19 +10,20 @@ have no zlib to link against.
 The engine was taken from [swift-png](https://github.com/PureSwift/swift-png), where it
 backs the PNG codec's compression path.
 
-## Two modules
+## Three modules
 
 They split where the specifications split.
 
 | | |
 |---|---|
 | `LZ77` | RFC 1951. DEFLATE data and nothing around it. Self-contained. |
-| `Zlib` | RFC 1950. The two-byte header, the Adler-32 trailer, and the checksums. |
+| `Zlib` | RFC 1950. The two-byte header, the Adler-32 trailer. |
+| `GZip` | RFC 1952. The longer header with its optional fields, the CRC-32 and length trailer. |
 
-The seam is there because the wrapper is the part that varies: gzip is the same DEFLATE
-data under a different header with a CRC-32 after it, so it belongs beside `Zlib` rather
-than inside it. A caller wanting raw DEFLATE depends on `LZ77` directly and carries none of
-the framing.
+The seam is there because the wrapper is the part that varies. `Zlib` and `GZip` are
+siblings over the same `LZ77`, not one inside the other — neither format is a special case
+of the other, and a caller wanting raw DEFLATE depends on `LZ77` directly and carries
+neither.
 
 `LZ77` never reads past the final block's end-of-block symbol, and exposes `alignToByte()`
 and `readBits(_:)` so a wrapper reads its own fields off the *same* input stream. That is
@@ -57,35 +58,18 @@ that stopped early would never learn it.
 
 ## What it produces
 
-A valid zlib stream (RFC 1950) of fixed-Huffman DEFLATE blocks (RFC 1951 §3.2.6) over LZ77
-matches found with a hash chain. Fixed blocks need no table sent and no tree built, which is
-most of the code and nearly all of the memory a dynamic-block encoder wants; on the targets
-this exists to serve, that trade is the right way round.
+Each block is written as stored (RFC 1951 §3.2.4) or fixed-Huffman (§3.2.6) over LZ77 matches
+found with a hash chain, whichever is smaller for that block — decided by costing the block's
+symbols rather than guessed. Dynamic blocks are the deliberate omission: they need a table
+built and sent, which is most of the code and nearly all of the memory a full encoder wants,
+and on the targets this exists to serve that trade is the right way round.
 
 The decompressor is complete: stored, fixed, and dynamic blocks are all read, so it accepts
 anything zlib emits.
 
-Two consequences of the encoder stopping at fixed blocks, both measured against zlib 1.3.1:
-
-- Compressible input comes out a few per cent larger than zlib's dynamic blocks would make it.
-- Incompressible input **expands by about 5.4%**, where zlib emits a stored block and expands
-  by 0.03%. There is no stored-block fallback yet, and `level: 0` does not mean "stored" here
-  the way it does in zlib — it means "literals only, no match search."
-
-## Status
-
-The codec is verified in both directions against the system zlib:
-
-- 128 cases of `Compressor` output — levels 0/1/6/9 over empty, tiny, repetitive,
-  incompressible, and larger-than-window inputs, fed and collected in chunks down to one
-  byte at a time — are all accepted by zlib and decode back to the original bytes.
-- 178 cases of zlib output — all five of its strategies, including `Z_FIXED` and
-  `Z_HUFFMAN_ONLY`, at four levels — decode correctly through `Decompressor`, whole and fed
-  in chunks of 1, 2, 3, 7, 13, and 997 bytes.
-
-Those differential runs are not yet in the repository. `swift test` runs the unit suites,
-which check the decoder against known-good streams, the encoder by round trip, and the
-framing by direct assertion.
+What the missing dynamic blocks cost, measured against zlib 1.3.1: compressible input comes
+out 1.4× to 6× larger. Incompressible input matches the reference byte for byte, because both
+fall back to storing it, and both stay inside `compressBound`.
 
 ## The C ABI
 
@@ -100,7 +84,7 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ./scripts/run_conformance.sh        # differential test against the system libz
 ```
 
-**All 88 symbols are exported; 34 are implemented.** The rest are generated stubs that report
+**All 88 symbols are exported; 36 are implemented.** The rest are generated stubs that report
 the gap on stderr and return the library's own error value, so a client gets a diagnostic
 rather than a link failure — and so each one becomes "move a name from `scripts/implemented.txt`
 and watch the conformance diff shrink". A name in both files is a duplicate-symbol link error,
@@ -111,13 +95,16 @@ so the two cannot drift.
 | Checksums | `adler32`, `crc32`, both `_z` forms, every `_combine` variant |
 | One-shot | `compress`, `compress2`, `uncompress`, `uncompress2`, `compressBound` |
 | Streaming | `deflate`/`inflate` with `Init_`, `Init2_`, `End`, `Reset`, `ResetKeep`, plus `inflateReset2`, `deflateBound`, `deflatePending` |
+| gzip metadata | `deflateSetHeader`, `inflateGetHeader` |
 | Identity | `zlibVersion`, `zError`, `zlibCompileFlags` |
 
-The streaming API covers zlib framing and raw DEFLATE — `windowBits` of 8…15 and −8…−15, with
-the window honoured rather than noted, since a decoder sizes its own from the header. Not yet:
-gzip framing (`windowBits` +16 and +32), dictionaries, `inflateBack`, `deflateCopy`/`Params`/
-`Prime`/`Tune`, and the whole `gz*` file layer. Each of those reports itself rather than
-failing quietly.
+The streaming API covers every framing the format offers: zlib (`windowBits` 8…15), raw
+DEFLATE (−8…−15), gzip (+16), and the mode that accepts either zlib or gzip without being told
+which (+32). The window is honoured rather than noted, since a decoder sizes its own from the
+header.
+
+Not yet: dictionaries, `inflateBack`, `deflateCopy`/`Params`/`Prime`/`Tune`, and the whole
+`gz*` file layer. Each of those reports itself rather than failing quietly.
 
 Two build systems on purpose. SwiftPM drives development and the tests; CMake builds the
 shipped artifact, because the soname, the install name and the version script are not
@@ -131,13 +118,16 @@ expressible in `Package.swift`.
   library — are **identical on every compared line**. `zconform.c` covers the checksums, the
   one-shot API and the error paths; `zstream.c` covers the streaming API across six input and
   output chunk-size combinations (down to one byte at a time in both directions), ten
-  compression levels, seven window sizes, zlib and raw framing, corrupt input, and misuse such
-  as calling `inflate` on an uninitialised stream.
+  compression levels, seven window sizes, all four framings, gzip headers written and read back
+  through buffers too small for them, corrupt input, truncated members, and misuse such as
+  calling `inflate` on an uninitialised stream.
 - A binary compiled and linked against the real libz produces byte-identical output when run
   with this library `LD_PRELOAD`ed.
-- **Python's `zlib` module** — an unmodified real consumer — passes one-shot, streaming and raw
-  round trips with this library preloaded. **git** writes a commit through it, and `git fsck`
-  then verifies those objects both with this library and with the stock one.
+- **Python's `zlib` and `gzip` modules** — unmodified real consumers — pass one-shot, streaming,
+  raw and gzip round trips with this library preloaded. **git** writes a commit through it, and
+  `git fsck` then verifies those objects both with this library and with the stock one.
+- A `.gz` written through this library is accepted by **`gunzip(1)`** with the bytes and the
+  recorded filename intact, and a `.gz` written by `gzip(1)` reads back through it.
 
 Three bugs were found by these harnesses that a round trip could not have found, all now
 regression-tested in `Tests/ZlibTests/StreamingTests.swift`: decompressing into a zero-length
