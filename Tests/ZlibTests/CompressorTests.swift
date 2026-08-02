@@ -10,10 +10,11 @@ struct CompressorTests {
     static func compress(
         _ payload: [UInt8],
         level: Int32 = 6,
+        windowBits: Int32 = 15,
         feeding chunkSize: Int = Int.max,
         collecting bufferSize: Int = 4096
     ) throws -> [UInt8] {
-        let compressor = Compressor(level: level)
+        let compressor = Compressor(level: level, windowBits: windowBits)
         var compressed: [UInt8] = []
         var scratch = [UInt8](repeating: 0, count: bufferSize)
         var offset = 0
