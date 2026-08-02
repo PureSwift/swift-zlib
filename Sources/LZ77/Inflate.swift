@@ -115,6 +115,18 @@ public final class Inflate {
         self.reader.bits(count)
     }
 
+    // -- accounting for how much input was used --------------------------------
+
+    /// How many bytes of the buffer last handed to ``setInput(_:)`` this stream has taken.
+    ///
+    /// Exact rather than approximate: nothing here reads ahead past what it needs, so when a
+    /// stream reports itself finished, this is the stream's length to the byte and everything
+    /// after it is still the caller's. That is what makes concatenated streams work, and what
+    /// lets a caller find the data following one embedded in a larger file.
+    public var pulledInputCount: Int {
+        self.reader.pulledByteCount
+    }
+
     // -- emitting produced bytes ------------------------------------------------
 
     /// Where the caller's buffer has been filled to; reset at the start of every call and
