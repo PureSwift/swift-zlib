@@ -20,6 +20,7 @@ let package = Package(
     name: "swift-zlib",
     products: [
         .library(name: "Zlib", targets: ["Zlib"]),
+        .library(name: "GZip", targets: ["GZip"]),
         .library(name: "LZ77", targets: ["LZ77"]),
 
         // For iterating on the C surface locally. The artifact that gets installed is built by
@@ -41,6 +42,14 @@ let package = Package(
             path: "Sources/Zlib"
         ),
 
+        // RFC 1952, over the same. A sibling of Zlib rather than a mode inside it: the two
+        // wrap identical DEFLATE data in different framing, and neither is a case of the other.
+        .target(
+            name: "GZip",
+            dependencies: ["LZ77"],
+            path: "Sources/GZip"
+        ),
+
         // The published C API as clients see it, plus the parts of the implementation that
         // have to be C: reporting an unimplemented entry point, and the variadics.
         .target(
@@ -53,7 +62,7 @@ let package = Package(
         // vendored header. Nothing here decides anything about compression.
         .target(
             name: "ZlibABI",
-            dependencies: ["CZlib", "Zlib"],
+            dependencies: ["CZlib", "Zlib", "GZip"],
             path: "Sources/ZlibABI"
         ),
 
@@ -61,6 +70,11 @@ let package = Package(
             name: "LZ77Tests",
             dependencies: ["LZ77"],
             path: "Tests/LZ77Tests"
+        ),
+        .testTarget(
+            name: "GZipTests",
+            dependencies: ["GZip"],
+            path: "Tests/GZipTests"
         ),
         .testTarget(
             name: "ZlibTests",
