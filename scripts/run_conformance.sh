@@ -26,15 +26,24 @@ echo "reference: system libz"
 echo "candidate: $BUILD"
 echo
 
-cc -O1 -o "$WORK/reference" "$ROOT/Conformance/zconform.c" -lz
+: > "$WORK/reference.out"
+: > "$WORK/candidate.out"
+: > "$WORK/reference.err"
+: > "$WORK/candidate.err"
 
-# Against this library, the vendored header is the one to compile against, and the library is
-# named on the command line directly rather than found by -lz.
-cc -O1 -I "$ROOT/Sources/CZlib/include" -o "$WORK/candidate" \
-    "$ROOT/Conformance/zconform.c" "$BUILD" -Wl,-rpath,"$(dirname "$BUILD")"
+for program in zconform zstream; do
+    cc -O1 -o "$WORK/reference" "$ROOT/Conformance/$program.c" -lz
 
-"$WORK/reference" > "$WORK/reference.out" 2> "$WORK/reference.err" || true
-"$WORK/candidate" > "$WORK/candidate.out" 2> "$WORK/candidate.err" || true
+    # Against this library, the vendored header is the one to compile against, and the library
+    # is named on the command line directly rather than found by -lz.
+    cc -O1 -I "$ROOT/Sources/CZlib/include" -o "$WORK/candidate" \
+        "$ROOT/Conformance/$program.c" "$BUILD" -Wl,-rpath,"$(dirname "$BUILD")"
+
+    echo "== $program ==" | tee -a "$WORK/reference.out" >> "$WORK/candidate.out"
+
+    "$WORK/reference" >> "$WORK/reference.out" 2>> "$WORK/reference.err" || true
+    "$WORK/candidate" >> "$WORK/candidate.out" 2>> "$WORK/candidate.err" || true
+done
 
 if [[ -s "$WORK/candidate.err" ]]; then
     echo "candidate reported unimplemented entry points:"
