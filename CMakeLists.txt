@@ -66,11 +66,16 @@ message(STATUS "${gen_stubs_output}")
 
 file(GLOB LZ77_SOURCES CONFIGURE_DEPENDS Sources/LZ77/*.swift)
 file(GLOB ZLIB_SOURCES CONFIGURE_DEPENDS Sources/Zlib/*.swift)
+file(GLOB GZIP_SOURCES CONFIGURE_DEPENDS Sources/GZip/*.swift)
 file(GLOB ABI_SOURCES CONFIGURE_DEPENDS Sources/ZlibABI/*.swift)
 file(GLOB CZLIB_SOURCES CONFIGURE_DEPENDS Sources/CZlib/*.c Sources/CZlib/gen/*.c)
 
 add_library(LZ77 STATIC ${LZ77_SOURCES})
 target_compile_options(LZ77 PRIVATE -parse-as-library)
+
+add_library(GZip STATIC ${GZIP_SOURCES})
+target_compile_options(GZip PRIVATE -parse-as-library)
+target_link_libraries(GZip PUBLIC LZ77)
 
 add_library(SwiftZlib STATIC ${ZLIB_SOURCES})
 set_target_properties(SwiftZlib PROPERTIES Swift_MODULE_NAME Zlib)
@@ -89,7 +94,7 @@ target_compile_options(ZlibABI PRIVATE
     -parse-as-library
     -Xcc -I${CMAKE_SOURCE_DIR}/Sources/CZlib/include
 )
-target_link_libraries(ZlibABI PUBLIC SwiftZlib CZlib)
+target_link_libraries(ZlibABI PUBLIC SwiftZlib GZip CZlib)
 
 # -- the shipped library ------------------------------------------------------
 
@@ -138,10 +143,11 @@ else()
 -Xlinker $<TARGET_FILE:ZlibABI> \
 -Xlinker $<TARGET_FILE:CZlib> \
 -Xlinker $<TARGET_FILE:SwiftZlib> \
+-Xlinker $<TARGET_FILE:GZip> \
 -Xlinker $<TARGET_FILE:LZ77> \
 -Xlinker --no-whole-archive"
     )
-    add_dependencies(z ZlibABI CZlib SwiftZlib LZ77)
+    add_dependencies(z ZlibABI CZlib SwiftZlib GZip LZ77)
 endif()
 
 install(TARGETS z LIBRARY DESTINATION lib)
