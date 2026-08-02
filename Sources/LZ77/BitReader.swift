@@ -29,17 +29,33 @@ struct BitReader {
         self.inputOffset >= self.input.count
     }
 
+    /// How many bytes have been taken out of the buffer handed to ``setInput(_:)``.
+    ///
+    /// After any read that succeeded, this is exactly how much of the input that read needed:
+    /// ``refill(upTo:)`` stops the moment it has enough, so no more than seven bits — never a
+    /// whole byte — are ever left over. That is what lets a caller say precisely where a stream
+    /// ended, and so what makes the bytes after one findable.
+    var pulledByteCount: Int {
+        self.inputOffset
+    }
+
     mutating func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         self.input = bytes
         self.inputOffset = 0
     }
 
-    /// Pulls whatever is left of the current input block into the bit buffer.
+    /// Pulls just enough bytes to satisfy a read of `count` bits, and not one more.
     ///
-    /// The buffer holds up to 64 bits and is topped up a byte at a time, so bits already read
-    /// but not yet consumed are never disturbed by a refill.
-    private mutating func refill() {
-        while self.bitCount <= 56, self.inputOffset < self.input.count {
+    /// The restraint is the point. Filling the buffer whenever there was room would be a little
+    /// faster and would quietly absorb up to eight bytes past whatever is being read — so at
+    /// the end of a stream, bytes belonging to whatever *follows* it would already be inside
+    /// this reader, and a caller asking where the stream ended would be told the wrong place.
+    ///
+    /// Pulling only on demand bounds it exactly: this stops as soon as `count` bits are
+    /// available, so at most seven bits are ever left over, which is less than a whole byte.
+    /// Every byte this reader has taken is therefore a byte it has genuinely read from.
+    private mutating func refill(upTo count: Int) {
+        while self.bitCount < count, self.inputOffset < self.input.count {
             self.buffer |= UInt64(self.input[self.inputOffset]) << self.bitCount
             self.inputOffset += 1
             self.bitCount += 8
@@ -52,7 +68,7 @@ struct BitReader {
     /// identical call can be retried once more has arrived.
     mutating func bits(_ count: Int) -> UInt32? {
         if self.bitCount < count {
-            self.refill()
+            self.refill(upTo: count)
 
             if self.bitCount < count {
                 return nil
