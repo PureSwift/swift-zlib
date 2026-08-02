@@ -11,6 +11,7 @@
 // `len2` zero bytes to A is multiplying its polynomial by x^(8·len2).
 
 import CZlib
+import GZip
 import Zlib
 
 // -- Adler-32 -----------------------------------------------------------------
