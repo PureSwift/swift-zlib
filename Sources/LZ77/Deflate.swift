@@ -107,22 +107,42 @@ public final class Deflate {
         self.streamEnded && self.writer.pendingByteCount == 0
     }
 
-    private var input: UnsafeBufferPointer<UInt8> = UnsafeBufferPointer(start: nil, count: 0)
-    private var inputOffset = 0
 
-    public init(level: Int32) {
+    /// How far back a match may point.
+    ///
+    /// A caller limits this when whatever will decompress the result has less than 32 KiB to
+    /// spare. Emitting a distance beyond what the stream declares produces something the
+    /// intended decoder cannot read, so this is a limit on the encoder rather than a hint to it.
+    private let windowSize: Int
+
+    /// - Parameter windowBits: the base-two logarithm of the window, 9 through 15.
+    public init(level: Int32, windowBits: Int32 = 15) {
         self.effort = Effort.forLevel(level)
         self.head = [Int](repeating: -1, count: Self.hashSize)
         self.chain = []
+        self.windowSize = 1 << max(9, min(15, Int(windowBits)))
     }
 
+    /// Whether this encoder is ready to be given more input.
+    ///
+    /// Always true, because ``setInput(_:)`` copies: there is never a buffer part-way through
+    /// being taken.
     public var needsInput: Bool {
-        self.inputOffset >= self.input.count
+        true
     }
 
+    /// Hands the encoder its next input, which it copies.
+    ///
+    /// Copied here rather than remembered and read later, which is what this did once. The
+    /// difference matters because a caller has no way to know whether a call that produced no
+    /// output also happened to skip taking the input — and a caller that hands over a second
+    /// buffer believing the first was taken loses it. Owning the bytes on receipt makes the
+    /// question unaskable.
     public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
-        self.input = bytes
-        self.inputOffset = 0
+        guard !bytes.isEmpty else { return }
+
+        self.pending.append(contentsOf: bytes)
+        self.chain.append(contentsOf: [Int](repeating: -1, count: bytes.count))
     }
 
     public enum Ending {
@@ -142,8 +162,6 @@ public final class Deflate {
         ending: Ending = .none
     ) throws(DeflateError) -> Int {
         guard count > 0 else { return 0 }
-
-        self.takeInput()
 
         // Everything but the tail is safe to compress now: a match needs `maxMatch` bytes of
         // lookahead to be sure it has found the longest one, so the last stretch waits until
@@ -169,19 +187,6 @@ public final class Deflate {
         }
 
         return self.drain(into: destination, count: count)
-    }
-
-    private func takeInput() {
-        guard self.inputOffset < self.input.count else { return }
-
-        let slice = UnsafeBufferPointer(
-            start: self.input.baseAddress! + self.inputOffset,
-            count: self.input.count - self.inputOffset
-        )
-
-        self.pending.append(contentsOf: slice)
-        self.chain.append(contentsOf: [Int](repeating: -1, count: slice.count))
-        self.inputOffset = self.input.count
     }
 
     private func drain(into destination: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
@@ -235,7 +240,7 @@ public final class Deflate {
         var best = 0
         var bestDistance = 0
 
-        let earliest = max(0, position - DeflateTables.windowSize)
+        let earliest = max(0, position - self.windowSize)
 
         while candidate >= earliest, chainLeft > 0 {
             chainLeft -= 1
@@ -302,7 +307,7 @@ public final class Deflate {
 
     /// Drops history no match can reach any more, so `pending` does not grow with the stream.
     private func trimWindow() {
-        let keep = DeflateTables.windowSize
+        let keep = self.windowSize
         guard self.cursor > keep * 2 else { return }
 
         // Never drop what the open block has not been written out of: if it closes as a stored
