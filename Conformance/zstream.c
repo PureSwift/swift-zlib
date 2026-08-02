@@ -268,6 +268,175 @@ static void corrupt(void) {
     }
 }
 
+/* gzip framing, and the mode that accepts either framing without being told which.
+ *
+ * Compressing with one setting and decompressing with another is the point: a decoder that
+ * detects the wrapper has to reach the same answer as one that was told. */
+static void gzip_modes(const unsigned char *data, size_t len) {
+    static const struct { int deflate_bits; int inflate_bits; const char *name; } modes[] = {
+        { 15 + 16, 15 + 16, "gzip" },
+        { 15 + 16, 15 + 32, "gzip->detect" },
+        { 15,      15 + 32, "zlib->detect" },
+    };
+
+    for (size_t m = 0; m < sizeof modes / sizeof modes[0]; m++) {
+        z_stream def;
+        memset(&def, 0, sizeof def);
+
+        int rc = deflateInit2(&def, 6, Z_DEFLATED, modes[m].deflate_bits, 8,
+                              Z_DEFAULT_STRATEGY);
+        printf("gz deflateInit2 %-14s %d\n", modes[m].name, rc);
+        if (rc != Z_OK) continue;
+
+        uLong bound = deflateBound(&def, (uLong)len);
+        unsigned char *packed = malloc(bound + 64);
+        def.next_in = (Bytef *)data;
+        def.avail_in = (uInt)len;
+        def.next_out = packed;
+        def.avail_out = (uInt)(bound + 64);
+
+        rc = deflate(&def, Z_FINISH);
+        size_t packed_len = (bound + 64) - def.avail_out;
+        printf("gz deflate      %-14s %d within_bound=%d\n", modes[m].name, rc,
+               (uLong)packed_len <= bound);
+        printf("SIZE: %-14s gz   %lu (bound %lu)\n", modes[m].name,
+               (unsigned long)packed_len, bound);
+
+        /* The header's own bytes, which are framing rather than compressed output and so must
+         * match the reference exactly. */
+        if (modes[m].deflate_bits > 15 && packed_len >= 10) {
+            printf("gz header       %-14s %02x %02x %02x %02x os=%02x\n", modes[m].name,
+                   packed[0], packed[1], packed[2], packed[3], packed[9]);
+        }
+        printf("gz crc          %-14s %08lx\n", modes[m].name, def.adler);
+        deflateEnd(&def);
+
+        z_stream inf;
+        memset(&inf, 0, sizeof inf);
+        rc = inflateInit2(&inf, modes[m].inflate_bits);
+        printf("gz inflateInit2 %-14s %d\n", modes[m].name, rc);
+        if (rc != Z_OK) { free(packed); continue; }
+
+        unsigned char *back = malloc(len + 64);
+        inf.next_in = packed;
+        inf.avail_in = (uInt)packed_len;
+        inf.next_out = back;
+        inf.avail_out = (uInt)(len + 64);
+
+        rc = inflate(&inf, Z_FINISH);
+        size_t back_len = (len + 64) - inf.avail_out;
+        printf("gz inflate      %-14s %d out=%lu avail_in=%u\n", modes[m].name, rc,
+               (unsigned long)back_len, inf.avail_in);
+        printf("gz identical    %-14s %d\n", modes[m].name,
+               back_len == len && memcmp(back, data, len) == 0);
+        printf("gz crc back     %-14s %08lx\n", modes[m].name, inf.adler);
+        inflateEnd(&inf);
+
+        free(packed);
+        free(back);
+    }
+
+    /* A member with a name and a comment, written and then read back. Both fields change where
+     * the compressed data starts, so a decoder that skips one wrongly reads the body from the
+     * wrong byte; and the read side fills buffers the caller sized, so a library that ignores
+     * those sizes corrupts the caller rather than itself. */
+    z_stream def;
+    memset(&def, 0, sizeof def);
+    if (deflateInit2(&def, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
+        gz_header head;
+        memset(&head, 0, sizeof head);
+        head.name = (Bytef *)"payload.txt";
+        head.comment = (Bytef *)"a comment";
+        head.time = 1234567890;
+        head.os = 3;
+        head.text = 1;
+
+        printf("gz setHeader    %d\n", deflateSetHeader(&def, &head));
+
+        unsigned char packed[8192];
+        def.next_in = (Bytef *)data;
+        def.avail_in = (uInt)len;
+        def.next_out = packed;
+        def.avail_out = (uInt)sizeof packed;
+        int rc = deflate(&def, Z_FINISH);
+        size_t packed_len = sizeof packed - def.avail_out;
+        printf("gz named deflate %d flags=%02x\n", rc, packed_len > 3 ? packed[3] : 0);
+        deflateEnd(&def);
+
+        /* Read it back, with buffers deliberately of different generosity: one ample, one so
+         * small the field has to be truncated and still terminated. */
+        static const uInt name_caps[] = { 64, 5 };
+
+        for (size_t c = 0; c < sizeof name_caps / sizeof name_caps[0]; c++) {
+            z_stream inf;
+            memset(&inf, 0, sizeof inf);
+            if (inflateInit2(&inf, 15 + 16) != Z_OK) continue;
+
+            gz_header got;
+            unsigned char name[64], comment[64], extra[64];
+            memset(&got, 0, sizeof got);
+            memset(name, 0xAA, sizeof name);
+            memset(comment, 0xAA, sizeof comment);
+            got.name = name;       got.name_max = name_caps[c];
+            got.comment = comment; got.comm_max = (uInt)sizeof comment;
+            got.extra = extra;     got.extra_max = (uInt)sizeof extra;
+
+            printf("gz getHeader    cap=%u %d\n", name_caps[c], inflateGetHeader(&inf, &got));
+
+            unsigned char back[8192];
+            inf.next_in = packed;
+            inf.avail_in = (uInt)packed_len;
+            inf.next_out = back;
+            inf.avail_out = (uInt)sizeof back;
+            rc = inflate(&inf, Z_FINISH);
+
+            printf("gz header done  cap=%u done=%d text=%d time=%lu os=%d\n",
+                   name_caps[c], got.done, got.text, got.time, got.os);
+            /* Printed as bytes rather than as a string: a field too long for its buffer comes
+             * back unterminated, so treating it as one would read past the buffer and would
+             * compare whatever happened to follow it. */
+            printf("gz header name  cap=%u ", name_caps[c]);
+            for (uInt i = 0; i < name_caps[c] && i < sizeof name; i++) printf("%02x", name[i]);
+            printf("\n");
+            printf("gz header comm  cap=%u ", name_caps[c]);
+            for (uInt i = 0; i < 12; i++) printf("%02x", comment[i]);
+            printf("\n");
+            printf("gz named body   cap=%u rc=%d identical=%d\n", name_caps[c], rc,
+                   (size_t)(sizeof back - inf.avail_out) == len
+                   && memcmp(back, data, len) == 0);
+            inflateEnd(&inf);
+        }
+    }
+
+    /* Truncated: every prefix of a member has to be refused rather than half-accepted. */
+    z_stream d2;
+    memset(&d2, 0, sizeof d2);
+    if (deflateInit2(&d2, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
+        unsigned char packed[8192];
+        d2.next_in = (Bytef *)data;
+        d2.avail_in = (uInt)len;
+        d2.next_out = packed;
+        d2.avail_out = (uInt)sizeof packed;
+        deflate(&d2, Z_FINISH);
+        size_t packed_len = sizeof packed - d2.avail_out;
+        deflateEnd(&d2);
+
+        for (size_t cut = 1; cut <= 4; cut++) {
+            z_stream inf;
+            memset(&inf, 0, sizeof inf);
+            if (inflateInit2(&inf, 15 + 16) != Z_OK) continue;
+            unsigned char back[8192];
+            inf.next_in = packed;
+            inf.avail_in = (uInt)(packed_len - cut * 2);
+            inf.next_out = back;
+            inf.avail_out = (uInt)sizeof back;
+            int rc = inflate(&inf, Z_FINISH);
+            printf("gz truncated -%zu finished=%d\n", cut * 2, rc == Z_STREAM_END);
+            inflateEnd(&inf);
+        }
+    }
+}
+
 static void misuse(void) {
     z_stream s;
     memset(&s, 0, sizeof s);
@@ -331,6 +500,7 @@ int main(void) {
 
     trailing_bytes();
     corrupt();
+    gzip_modes(payload, payload_len);
     misuse();
 
     return 0;
