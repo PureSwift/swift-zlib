@@ -100,16 +100,24 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ./scripts/run_conformance.sh        # differential test against the system libz
 ```
 
-**All 88 symbols are exported; 19 are implemented.** The rest are generated stubs that report
+**All 88 symbols are exported; 34 are implemented.** The rest are generated stubs that report
 the gap on stderr and return the library's own error value, so a client gets a diagnostic
 rather than a link failure — and so each one becomes "move a name from `scripts/implemented.txt`
 and watch the conformance diff shrink". A name in both files is a duplicate-symbol link error,
 so the two cannot drift.
 
-Implemented: the checksums (`adler32`, `crc32`, both `_z` and every `_combine` variant),
-`compress`/`compress2`/`uncompress`/`uncompress2`/`compressBound`, and
-`zlibVersion`/`zError`/`zlibCompileFlags`. Not yet: the `z_stream` streaming API, and the whole
-`gz*` file layer.
+| | |
+|---|---|
+| Checksums | `adler32`, `crc32`, both `_z` forms, every `_combine` variant |
+| One-shot | `compress`, `compress2`, `uncompress`, `uncompress2`, `compressBound` |
+| Streaming | `deflate`/`inflate` with `Init_`, `Init2_`, `End`, `Reset`, `ResetKeep`, plus `inflateReset2`, `deflateBound`, `deflatePending` |
+| Identity | `zlibVersion`, `zError`, `zlibCompileFlags` |
+
+The streaming API covers zlib framing and raw DEFLATE — `windowBits` of 8…15 and −8…−15, with
+the window honoured rather than noted, since a decoder sizes its own from the header. Not yet:
+gzip framing (`windowBits` +16 and +32), dictionaries, `inflateBack`, `deflateCopy`/`Params`/
+`Prime`/`Tune`, and the whole `gz*` file layer. Each of those reports itself rather than
+failing quietly.
 
 Two build systems on purpose. SwiftPM drives development and the tests; CMake builds the
 shipped artifact, because the soname, the install name and the version script are not
@@ -119,11 +127,23 @@ expressible in `Package.swift`.
 
 - The built library exports **exactly** the reference's 88 symbols under the reference's own
   version nodes — nothing missing, and none of the ~190 Swift symbols a naive link leaks.
-- `Conformance/zconform.c` compiled twice, against the reference and against this library, is
-  **identical on every compared line**: every checksum, every running and combined checksum,
-  every return code, every error path.
+- Two conformance programs, each compiled twice — against the reference and against this
+  library — are **identical on every compared line**. `zconform.c` covers the checksums, the
+  one-shot API and the error paths; `zstream.c` covers the streaming API across six input and
+  output chunk-size combinations (down to one byte at a time in both directions), ten
+  compression levels, seven window sizes, zlib and raw framing, corrupt input, and misuse such
+  as calling `inflate` on an uninitialised stream.
 - A binary compiled and linked against the real libz produces byte-identical output when run
   with this library `LD_PRELOAD`ed.
+- **Python's `zlib` module** — an unmodified real consumer — passes one-shot, streaming and raw
+  round trips with this library preloaded. **git** writes a commit through it, and `git fsck`
+  then verifies those objects both with this library and with the stock one.
+
+Three bugs were found by these harnesses that a round trip could not have found, all now
+regression-tested in `Tests/ZlibTests/StreamingTests.swift`: decompressing into a zero-length
+buffer never reported finished; a decoder reading ahead reported the wrong end of a stream and
+then deadlocked; and handing the encoder a second input buffer while its output buffer was full
+silently lost the first.
 
 Compressed *sizes* are the one thing allowed to differ, since nothing requires two encoders to
 agree. `run_conformance.sh` reports them as a table: equal or better on incompressible and
