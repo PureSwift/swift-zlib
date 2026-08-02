@@ -28,3 +28,22 @@ uncompress2
 zlibVersion
 zError
 zlibCompileFlags
+
+# Streaming decompression, in InflateAPI.swift.
+inflateInit_
+inflateInit2_
+inflate
+inflateEnd
+inflateReset
+inflateReset2
+inflateResetKeep
+
+# Streaming compression, in DeflateAPI.swift.
+deflateInit_
+deflateInit2_
+deflate
+deflateEnd
+deflateReset
+deflateResetKeep
+deflateBound
+deflatePending
