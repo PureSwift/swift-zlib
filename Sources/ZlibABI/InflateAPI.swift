@@ -42,6 +42,36 @@ final class InflateStream {
     /// answered, so a header is reported once rather than rewritten on every call.
     var headerRequest: gz_headerp?
 
+    /// Whether the trailer is checked, which `inflateValidate` turns off.
+    var validatesChecksum = true
+
+    /// How much of the sync marker `inflateSync` has matched so far, kept across calls because
+    /// the four bytes may be split across as many buffers.
+    var syncMatched = 0
+
+    /// An independent copy, sharing nothing.
+    func copy() -> InflateStream {
+        let clone = InflateStream(wrapper: self.wrapper, windowBits: self.windowBits)
+
+        switch self.engine {
+        case let .zlib(decompressor): clone.engine = .zlib(decompressor.copy())
+        case let .gzip(decompressor): clone.engine = .gzip(decompressor.copy())
+        case let .raw(inflate): clone.engine = .raw(inflate.copy())
+        case .undecided: clone.engine = .undecided
+        }
+
+        clone.ended = self.ended
+        clone.validatesChecksum = self.validatesChecksum
+        clone.syncMatched = self.syncMatched
+
+        // Deliberately not carried over: a `gz_header` belongs to whoever asked for it, and a
+        // copy filling in the original's buffers would write through a pointer its own caller
+        // never handed over.
+        clone.headerRequest = nil
+
+        return clone
+    }
+
     init(wrapper: Wrapper, windowBits: Int32) {
         self.wrapper = wrapper
         self.windowBits = windowBits
@@ -222,6 +252,18 @@ public func inflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
     }
 
     let used = consume(strm, state, produced: produced)
+
+    // A stream that has named its dictionary can go no further until it is supplied. The id
+    // goes where the reference puts it — in `adler`, displacing the running checksum until the
+    // dictionary arrives — and the status is its own, because a caller that mistakes this for
+    // progress loops forever.
+    if case let .zlib(decompressor) = state.engine, decompressor.needsDictionary {
+        if let id = decompressor.dictionaryId {
+            strm.pointee.adler = UInt(id)
+        }
+
+        return Status.needDictionary
+    }
 
     if state.isFinished {
         state.ended = true
