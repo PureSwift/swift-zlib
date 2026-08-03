@@ -130,7 +130,14 @@ public final class Decompressor {
         loop: while true {
             switch self.state {
             case .fixedHeader:
-                guard try self.collect(10) else { break loop }
+                let complete = try self.collect(10)
+
+                // Checked as the bytes arrive rather than once ten are in hand. A member whose
+                // third byte names a method that does not exist is wrong at that byte, and a
+                // caller holding only four of them is entitled to be told so.
+                try self.validateHeaderPrefix()
+
+                guard complete else { break loop }
                 try self.parseFixedHeader()
 
             case .extraLength:
@@ -278,15 +285,28 @@ public final class Decompressor {
         }
     }
 
-    private func parseFixedHeader() throws(DeflateError) {
-        guard self.field[0] == 0x1F, self.field[1] == 0x8B else {
+    /// Checks as much of the fixed header as has arrived.
+    private func validateHeaderPrefix() throws(DeflateError) {
+        if self.field.count >= 1, self.field[0] != 0x1F {
             throw DeflateError("not a gzip member")
         }
 
-        guard self.field[2] == 8 else {
+        if self.field.count >= 2, self.field[1] != 0x8B {
+            throw DeflateError("not a gzip member")
+        }
+
+        if self.field.count >= 3, self.field[2] != 8 {
             throw DeflateError("unsupported compression method")
         }
 
+        // §2.3.1.2 reserves the top three flag bits and requires a decoder to refuse a member
+        // that sets them, rather than guess what they were meant to mean.
+        if self.field.count >= 4, self.field[3] & 0xE0 != 0 {
+            throw DeflateError("reserved gzip flags are set")
+        }
+    }
+
+    private func parseFixedHeader() throws(DeflateError) {
         self.flags = self.field[3]
 
         self.header.isText = self.flags & 0x01 != 0
@@ -300,12 +320,6 @@ public final class Decompressor {
         self.header.operatingSystem = self.field[9]
 
         self.field = []
-
-        guard self.flags & 0xE0 == 0 else {
-            // §2.3.1.2 reserves the top three bits and requires a decoder to refuse a member
-            // that sets them, rather than guess what they were meant to mean.
-            throw DeflateError("reserved gzip flags are set")
-        }
 
         if self.flags & 0x04 != 0 {
             self.state = .extraLength
