@@ -150,22 +150,103 @@ struct DecompressorTests {
         }
     }
 
-    /// A preset dictionary is a promise this cannot keep without being handed the dictionary,
-    /// and decoding the stream as though the flag were not set produces plausible garbage.
-    @Test("A preset-dictionary stream is refused")
+    /// A preset-dictionary stream stops and asks rather than failing or guessing: it is well
+    /// formed, and simply refers to text that was never in it.
+    @Test("A preset-dictionary stream asks for the dictionary")
     func presetDictionary() throws {
-        // FDICT set, with the check bits fixed up so the header is otherwise well formed.
-        var cmf: UInt32 = 0x78
-        var flg: UInt32 = 0x20
+        let dictionary = Array("the quick brown fox jumps over the lazy dog. ".utf8)
+        let payload = Array("the quick brown fox is quicker than the lazy dog".utf8)
 
-        while (cmf * 256 + flg) % 31 != 0 {
-            flg += 1
+        let compressor = Compressor(level: 6)
+        var mutableDictionary = dictionary
+
+        mutableDictionary.withUnsafeMutableBufferPointer {
+            #expect(compressor.setDictionary(UnsafeBufferPointer($0)))
         }
 
-        cmf = 0x78
+        var compressed: [UInt8] = []
+        var scratch = [UInt8](repeating: 0, count: 512)
+        var mutablePayload = payload
 
-        #expect(throws: DeflateError.self) {
-            _ = try Self.inflate([UInt8(cmf), UInt8(flg), 0x03, 0x00])
+        try mutablePayload.withUnsafeMutableBufferPointer { buffer in
+            compressor.setInput(UnsafeBufferPointer(buffer))
+
+            while !compressor.isFinished {
+                let made = try scratch.withUnsafeMutableBufferPointer {
+                    try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .finish)
+                }
+                compressed.append(contentsOf: scratch[0 ..< made])
+            }
         }
+
+        // §2.2: the flag is set, and the dictionary's checksum follows the header.
+        #expect((compressed[1] >> 5) & 1 == 1)
+
+        var expectedId = Adler32()
+        dictionary.withUnsafeBufferPointer { expectedId.update($0) }
+
+        let stream = Decompressor()
+        var output = [UInt8](repeating: 0, count: 512)
+        var produced = 0
+        var input = compressed
+
+        try input.withUnsafeMutableBufferPointer { buffer in
+            stream.setInput(UnsafeBufferPointer(buffer))
+
+            produced = try output.withUnsafeMutableBufferPointer {
+                try stream.inflate(into: $0.baseAddress!, count: $0.count)
+            }
+        }
+
+        #expect(stream.needsDictionary)
+        #expect(stream.dictionaryId == expectedId.value)
+        #expect(produced == 0)
+        #expect(!stream.isFinished)
+
+        mutableDictionary.withUnsafeMutableBufferPointer {
+            #expect(stream.setDictionary(UnsafeBufferPointer($0)))
+        }
+
+        produced += try output.withUnsafeMutableBufferPointer {
+            try stream.inflate(into: $0.baseAddress! + produced, count: $0.count - produced)
+        }
+
+        #expect(stream.isFinished)
+        #expect(Array(output[0 ..< produced]) == payload)
+    }
+
+    /// Matching against a dictionary is the point of having one, so a payload that shares its
+    /// text has to come out smaller with one than without.
+    @Test("A dictionary makes a small stream smaller")
+    func dictionaryHelps() throws {
+        let dictionary = Array(String(repeating: "abcdefghij", count: 40).utf8)
+        let payload = Array(String(repeating: "abcdefghij", count: 6).utf8)
+
+        let plain = try CompressorTests.compress(payload)
+
+        let compressor = Compressor(level: 6)
+        var mutableDictionary = dictionary
+        mutableDictionary.withUnsafeMutableBufferPointer {
+            _ = compressor.setDictionary(UnsafeBufferPointer($0))
+        }
+
+        var withDictionary: [UInt8] = []
+        var scratch = [UInt8](repeating: 0, count: 512)
+        var mutablePayload = payload
+
+        try mutablePayload.withUnsafeMutableBufferPointer { buffer in
+            compressor.setInput(UnsafeBufferPointer(buffer))
+
+            while !compressor.isFinished {
+                let made = try scratch.withUnsafeMutableBufferPointer {
+                    try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .finish)
+                }
+                withDictionary.append(contentsOf: scratch[0 ..< made])
+            }
+        }
+
+        // Four bytes of dictionary id are the price; the match that reaches back into it more
+        // than pays for them.
+        #expect(withDictionary.count < plain.count)
     }
 }
