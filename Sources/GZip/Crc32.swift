@@ -16,7 +16,10 @@ public struct Crc32 {
 
     /// One entry per possible byte, so the checksum advances a byte at a time
     /// instead of a bit at a time.
-    private static let table: [UInt32] = {
+    ///
+    /// Published because zlib publishes it: `get_crc_table` hands this very array to callers
+    /// that want to compute the same checksum themselves.
+    public static let table: [UInt32] = {
         var table = [UInt32](repeating: 0, count: 256)
 
         for index in 0 ..< 256 {
@@ -51,14 +54,14 @@ public struct Crc32 {
         var state = self.state
 
         for byte in bytes {
-            state = Self.table[Int((state ^ UInt32(byte)) & 0xFF)] ^ (state >> 8)
+            state = Crc32.table[Int((state ^ UInt32(byte)) & 0xFF)] ^ (state >> 8)
         }
 
         self.state = state
     }
 
     public mutating func update(_ byte: UInt8) {
-        self.state = Self.table[Int((self.state ^ UInt32(byte)) & 0xFF)]
+        self.state = Crc32.table[Int((self.state ^ UInt32(byte)) & 0xFF)]
             ^ (self.state >> 8)
     }
 
