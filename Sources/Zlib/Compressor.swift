@@ -15,7 +15,7 @@ import LZ77
 public final class Compressor {
     public typealias Ending = Deflate.Ending
 
-    private let stream: Deflate
+    private var stream: Deflate
     private var checksumState = Adler32()
 
     /// Framing bytes waiting for room in a caller's buffer — the header before anything else has
@@ -38,10 +38,65 @@ public final class Compressor {
     /// under it works to. Kept so the header can be built from it.
     private let windowBits: Int32
 
+    /// The Adler-32 of a preset dictionary, which §2.2 puts in the header so a decoder can
+    /// check it has the same one. Absent when there is no dictionary.
+    private var dictionaryId: UInt32?
+
+    private let level: Int32
+
     /// - Parameter windowBits: the base-two logarithm of the window, 9 through 15.
     public init(level: Int32 = 6, windowBits: Int32 = 15) {
+        self.level = level
         self.windowBits = max(9, min(15, windowBits))
         self.stream = Deflate(level: level, windowBits: self.windowBits)
+    }
+
+    /// Compresses against text the decoder is assumed to have already.
+    ///
+    /// Worth it for many small streams that share their vocabulary — each one can point into
+    /// the dictionary from its first byte instead of spending its opening bytes rebuilding it.
+    /// Only before anything has been written, the header having to record that there is one.
+    public func setDictionary(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard !self.wroteHeader else { return false }
+
+        var checksum = Adler32()
+        checksum.update(bytes)
+        self.dictionaryId = checksum.value
+
+        self.stream.primeWindow(bytes)
+        return true
+    }
+
+    /// The window's worth of context a decoder would need to carry on from here.
+    public var dictionary: [UInt8] {
+        self.stream.dictionary
+    }
+
+    public func setLevel(_ level: Int32) {
+        self.stream.setLevel(level)
+    }
+
+    public func tune(_ goodMatch: Int, _ maxLazy: Int, _ maxChainLength: Int) {
+        self.stream.tune(goodMatch: goodMatch, maxLazy: maxLazy, maxChainLength: maxChainLength)
+    }
+
+    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+        self.stream.prime(value, bits: count)
+    }
+
+    /// An independent copy, sharing nothing.
+    public func copy() -> Compressor {
+        let clone = Compressor(level: self.level, windowBits: self.windowBits)
+
+        clone.stream = self.stream.copy()
+        clone.checksumState = self.checksumState
+        clone.pending = self.pending
+        clone.pendingOffset = self.pendingOffset
+        clone.wroteHeader = self.wroteHeader
+        clone.wroteTrailer = self.wroteTrailer
+        clone.dictionaryId = self.dictionaryId
+
+        return clone
     }
 
     /// The Adler-32 of everything handed in so far.
@@ -72,7 +127,7 @@ public final class Compressor {
         guard count > 0 else { return 0 }
 
         if !self.wroteHeader {
-            self.pending = Self.header(windowBits: self.windowBits)
+            self.pending = Self.header(windowBits: self.windowBits, dictionaryId: self.dictionaryId)
             self.pendingOffset = 0
             self.wroteHeader = true
         }
@@ -131,15 +186,26 @@ public final class Compressor {
     /// The window recorded here is the one the encoder was actually held to, not a fixed 32 KiB:
     /// a decoder sizes its own window from this byte, and telling it more than the encoder used
     /// only wastes its memory while telling it less would be a lie it cannot survive.
-    private static func header(windowBits: Int32) -> [UInt8] {
+    private static func header(windowBits: Int32, dictionaryId: UInt32?) -> [UInt8] {
         let cmf = UInt32((windowBits - 8) << 4) | 8
-        var flg: UInt32 = 0
+        var flg: UInt32 = dictionaryId == nil ? 0 : 0x20
 
         while (cmf * 256 + flg) % 31 != 0 {
             flg += 1
         }
 
-        return [UInt8(cmf), UInt8(flg)]
+        var bytes = [UInt8(cmf), UInt8(truncatingIfNeeded: flg)]
+
+        // §2.2: the dictionary's Adler-32 follows the two header bytes, most significant first,
+        // so a decoder can tell whether the dictionary it holds is the one that was used.
+        if let dictionaryId {
+            bytes.append(UInt8(truncatingIfNeeded: dictionaryId >> 24))
+            bytes.append(UInt8(truncatingIfNeeded: dictionaryId >> 16))
+            bytes.append(UInt8(truncatingIfNeeded: dictionaryId >> 8))
+            bytes.append(UInt8(truncatingIfNeeded: dictionaryId))
+        }
+
+        return bytes
     }
 
     /// §2.2: the Adler-32 of the uncompressed data, most significant byte first — the one field
