@@ -14,6 +14,15 @@ struct DeflateTests {
         level: Int32,
         feeding chunkSize: Int = Int.max
     ) throws -> [UInt8] {
+        let compressed = try Self.compress(payload, level: level, feeding: chunkSize)
+        return try InflateTests.inflate(compressed, into: max(payload.count, 1) * 2 + 64)
+    }
+
+    static func compress(
+        _ payload: [UInt8],
+        level: Int32,
+        feeding chunkSize: Int = Int.max
+    ) throws -> [UInt8] {
         let compressor = Deflate(level: level)
         var compressed: [UInt8] = []
         var scratch = [UInt8](repeating: 0, count: 4096)
@@ -50,7 +59,7 @@ struct DeflateTests {
             }
         }
 
-        return try InflateTests.inflate(compressed, into: max(payload.count, 1) * 2 + 64)
+        return compressed
     }
 
     @Test("Empty input produces a valid empty stream")
