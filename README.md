@@ -70,12 +70,20 @@ same level, and on **Silesia** (212 MB) **0.26% smaller** — every file within 
 way, and every file verified in both directions: compressed here and read by the reference, and
 compressed by the reference and read here. `./scripts/check_corpus.sh <directory>` repeats it.
 
-It is **slower**, and that is the honest trade. Measured against zlib 1.3.1 on the same files,
-decompression runs at roughly a sixth to a ninth of the reference's speed and compression a
-third to a fifth. The reference has had twenty-five years of tuning by people who cared about
-exactly this; what is here is a straightforward implementation that has been made correct
-first. Nothing about the structure prevents closing the gap further — zlib's decoder resolves
-several bytes per iteration where this one resolves one.
+It is **slower**, and that is the honest trade: decompression runs at a quarter to a fifth of
+the reference's speed and compression a third to a fifth. The reference has had twenty-five
+years of tuning by people who cared about exactly this. Half of the original gap turned out to
+be Swift's dynamic exclusivity checking — every mutating access to a struct stored in a class
+is checked at runtime, once per decoded symbol — and was removed *without* unsafe flags by
+moving each stream's state into a `~Copyable` struct core, where the same mutation through
+`inout self` is checked at compile time. The remaining gap is structural: zlib's decoder
+resolves several bytes per iteration where this one resolves one.
+
+The streaming types also carry a span-shaped API alongside the pointer one: input arrives as a
+borrowed `Span` that cannot be stored, output goes through `OutputSpan`, and what a call did
+not consume is re-offered next call — the contract the pointer API could only document, now
+stated in types the compiler enforces. The pointer entry points remain, because the C ABI
+underneath is made of exactly such pointers.
 
 Sizes against zlib 1.3.1 at the same level: within 0.3% on most inputs at levels 6 and 9,
 identical on incompressible input (both store it), and *smaller* on English text, source code
@@ -88,8 +96,14 @@ dozen bytes.
 
 The engine builds and runs under Embedded Swift — no Foundation, no existentials in its error
 paths, no zlib to link against — which is the configuration where a Swift implementation is
-load-bearing rather than an alternative. `./scripts/check_embedded.sh` compresses and
-decompresses 40 KB through both wrappers and checks the result, then compiles the engine for
+load-bearing rather than an alternative. The package carries an `Embedded` trait:
+
+```
+swift build --traits Embedded -Xswiftc -wmo --target Zlib
+```
+
+`./scripts/check_embedded.sh` builds all three modules that way, compresses and decompresses
+40 KB through both wrappers and checks the result, then compiles the engine for
 `aarch64-none-none-elf`, `armv7-none-none-eabi` and `riscv32-none-none-eabi`.
 
 It is a script rather than a claim because this is easy to break from an ordinary desktop build
