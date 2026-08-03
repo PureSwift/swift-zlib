@@ -28,14 +28,19 @@ public final class Deflate {
         let goodMatch: Int
         let maxLazy: Int
 
+        /// `maxLazy` of zero means take every match as it is found, without looking a byte
+        /// further — which is what the reference does for its fast levels, and what the levels
+        /// below four ask for by asking to be fast. Deferring doubles the number of searches,
+        /// and on data whose matches cluster around the threshold it can cost a little size as
+        /// well: it is a heuristic, not a strict improvement.
         static func forLevel(_ level: Int32) -> Effort {
             switch level {
             case ..<1: return Effort(maxChainLength: 0, goodMatch: 0, maxLazy: 0)
-            case 1: return Effort(maxChainLength: 4, goodMatch: 8, maxLazy: 4)
-            case 2: return Effort(maxChainLength: 8, goodMatch: 16, maxLazy: 5)
-            case 3: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 6)
+            case 1: return Effort(maxChainLength: 4, goodMatch: 8, maxLazy: 0)
+            case 2: return Effort(maxChainLength: 8, goodMatch: 16, maxLazy: 0)
+            case 3: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 0)
             case 4: return Effort(maxChainLength: 16, goodMatch: 16, maxLazy: 4)
-            case 5: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 8)
+            case 5: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 16)
             case 6: return Effort(maxChainLength: 128, goodMatch: 128, maxLazy: 16)
             case 7: return Effort(maxChainLength: 256, goodMatch: 128, maxLazy: 32)
             case 8: return Effort(maxChainLength: 1024, goodMatch: 258, maxLazy: 128)
@@ -83,6 +88,24 @@ public final class Deflate {
     /// Where in `pending` the open block's uncompressed bytes start, which is what a stored
     /// block writes out and therefore what cannot be trimmed away while the block is open.
     private var blockStart = 0
+
+    /// A match found at the position before ``cursor`` and not yet committed to.
+    ///
+    /// This is what "lazy" means: a match is not taken the moment it is found. The byte after it
+    /// is examined first, and if a longer match starts there, the byte this one started on is
+    /// written as a literal instead. One byte of hindsight, and worth a few per cent — long
+    /// matches are what cost the fewest bits per byte covered, and greedily taking a short one
+    /// can hide a longer one that began just after it.
+    private var deferred: (length: Int, distance: Int)?
+
+    /// The position after the last symbol actually emitted.
+    ///
+    /// Not the same as ``cursor`` while a match is deferred: the byte it starts on has been read
+    /// past but nothing has been written for it yet. Blocks are measured to here rather than to
+    /// the cursor, since a stored block writes out exactly the bytes its symbols stand for.
+    private var emittedEnd: Int {
+        self.deferred == nil ? self.cursor : self.cursor - 1
+    }
 
     /// How often each symbol occurs in the open block, which is what a dynamic block's tables
     /// are fitted to and what all three block types are costed from.
@@ -181,11 +204,15 @@ public final class Deflate {
                 break
 
             case .flush:
+                self.resolveDeferred()
                 self.flushBlock(final: false)
                 self.writeSyncMarker()
 
             case .finish:
                 if !self.streamEnded {
+                    // Whatever is still being held has to be written before the stream can end,
+                    // or the bytes it stands for are simply lost.
+                    self.resolveDeferred()
                     self.flushBlock(final: true)
                     self.streamEnded = true
                 }
@@ -278,36 +305,80 @@ public final class Deflate {
     private func compressAvailable(keepingBack keepBack: Int) {
         let limit = self.pending.count
 
+        // Level zero asks for no match search at all, so there is nothing to be lazy about.
+        guard self.effort.maxChainLength > 0 else {
+            while self.cursor + keepBack < limit {
+                self.appendLiteral(self.pending[self.cursor])
+                self.cursor += 1
+
+                if self.blockIsFull { self.flushBlock(final: false) }
+            }
+
+            self.trimWindow()
+            return
+        }
+
         while self.cursor + keepBack < limit {
-            if self.effort.maxChainLength > 0,
-               let match = self.longestMatch(at: self.cursor, limit: limit) {
-                self.appendMatch(length: match.length, distance: match.distance)
+            let current = self.longestMatch(at: self.cursor, limit: limit)
+            self.insert(at: self.cursor)
 
-                for offset in 0 ..< match.length {
-                    self.insert(at: self.cursor + offset)
+            if let held = self.deferred {
+                if let current, current.length > held.length {
+                    // Starting a byte later pays better, so the byte the held match began on
+                    // becomes a literal and the new match is held in its place.
+                    self.appendLiteral(self.pending[self.cursor - 1])
+                    self.deferred = current
+                    self.cursor += 1
+                } else {
+                    self.take(held, startingAt: self.cursor - 1)
                 }
-
-                self.cursor += match.length
+            } else if let current {
+                // A match already long enough is taken without looking further: past the level's
+                // threshold the search costs more than the byte it might save.
+                if current.length < self.effort.maxLazy {
+                    self.deferred = current
+                    self.cursor += 1
+                } else {
+                    self.take(current, startingAt: self.cursor)
+                }
             } else {
                 self.appendLiteral(self.pending[self.cursor])
-
-                if self.effort.maxChainLength > 0 {
-                    self.insert(at: self.cursor)
-                }
-
                 self.cursor += 1
             }
 
-            if self.blockIsFull {
-                self.flushBlock(final: false)
-            }
+            if self.blockIsFull { self.flushBlock(final: false) }
         }
 
         self.trimWindow()
     }
 
+    /// Commits to a match, and puts the positions it covers into the hash chain.
+    private func take(_ match: (length: Int, distance: Int), startingAt start: Int) {
+        self.appendMatch(length: match.length, distance: match.distance)
+
+        // `start` and `cursor` are already in the chain — every position passes through the top
+        // of the loop above — so only what the match covers beyond them is left to insert.
+        let end = start + match.length
+
+        if end > self.cursor + 1 {
+            for position in (self.cursor + 1) ..< end {
+                self.insert(at: position)
+            }
+        }
+
+        self.cursor = end
+        self.deferred = nil
+    }
+
+    /// Commits to whatever is being held, so that a block can close on a whole number of
+    /// symbols. Nothing may be written out while a match is still undecided.
+    private func resolveDeferred() {
+        guard let held = self.deferred else { return }
+        self.take(held, startingAt: self.cursor - 1)
+    }
+
     private var blockIsFull: Bool {
-        self.cursor - self.blockStart >= Self.maxBlockBytes
+        self.emittedEnd - self.blockStart >= Self.maxBlockBytes
             || self.symbols.count >= Self.maxBlockSymbols
     }
 
@@ -386,7 +457,8 @@ public final class Deflate {
     /// at all still ends with a final block, and how `.flush` produces something a reader can
     /// act on rather than nothing at all.
     private func flushBlock(final: Bool) {
-        let storedLength = self.cursor - self.blockStart
+        let blockEnd = self.emittedEnd
+        let storedLength = blockEnd - self.blockStart
 
         // Every block ends with one, and it has to be counted before the tables are fitted or
         // the symbol that always occurs would be the one left out of them.
@@ -420,7 +492,7 @@ public final class Deflate {
 
         self.symbols.removeAll(keepingCapacity: true)
         self.extraBits = 0
-        self.blockStart = self.cursor
+        self.blockStart = blockEnd
 
         for index in self.literalFrequencies.indices { self.literalFrequencies[index] = 0 }
         for index in self.distanceFrequencies.indices { self.distanceFrequencies[index] = 0 }
