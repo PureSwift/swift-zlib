@@ -68,6 +68,18 @@ after checking whether a longer one starts on the next byte — which is the sam
 reference makes, and for the same reason: deferring doubles the number of searches and on some
 data costs a little size as well.
 
+On the **Canterbury** corpus this library's output totals **0.81% smaller** than zlib's at the
+same level, and on **Silesia** (212 MB) **0.26% smaller** — every file within about 1.5% either
+way, and every file verified in both directions: compressed here and read by the reference, and
+compressed by the reference and read here. `./scripts/check_corpus.sh <directory>` repeats it.
+
+It is **slower**, and that is the honest trade. Measured against zlib 1.3.1 on the same files,
+decompression runs at roughly a sixth to a ninth of the reference's speed and compression a
+third to a fifth. The reference has had twenty-five years of tuning by people who cared about
+exactly this; what is here is a straightforward implementation that has been made correct
+first. Nothing about the structure prevents closing the gap further — zlib's decoder resolves
+several bytes per iteration where this one resolves one.
+
 Sizes against zlib 1.3.1 at the same level: within 0.3% on most inputs at levels 6 and 9,
 identical on incompressible input (both store it), and *smaller* on English text, source code
 and run-structured data. At level 1 the output is smaller than the reference's on every input
