@@ -129,6 +129,16 @@ final class InflateStream {
         }
     }
 
+    /// How many bytes the engine wrote before it stopped, error or not.
+    var producedInLastCall: Int {
+        switch self.engine {
+        case let .zlib(stream): return stream.producedInLastCall
+        case let .gzip(stream): return stream.producedInLastCall
+        case let .raw(stream): return stream.producedInLastCall
+        case .undecided: return 0
+        }
+    }
+
     var pulledInputCount: Int {
         switch self.engine {
         case let .zlib(stream): return stream.pulledInputCount
@@ -237,7 +247,11 @@ public func inflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
         // A malformed stream, a bad checksum, a distance reaching out of the window: the data
         // is wrong, which is a different thing from this library being unable to continue, and
         // callers act on the difference.
-        _ = consume(strm, state, produced: 0)
+        //
+        // Whatever decoded before the failure is kept and accounted for. It is already in the
+        // caller's buffer, and a caller salvaging what it can from a damaged stream wants
+        // precisely the part that decoded — reporting zero would hide it.
+        _ = consume(strm, state, produced: state.producedInLastCall)
         setMessage(strm, zError(Status.dataError))
         return Status.dataError
     }
@@ -275,9 +289,16 @@ public func inflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
     // forever, since Z_OK is exactly the answer that means "call me again".
     //
     // Not fatal, and not the same as an error in the data: the caller supplies more input or
-    // more room and carries on. `flush` does not enter into it — a starved stream is starved
-    // whether or not the caller has said there is more coming.
+    // more room and carries on.
     if used == 0, produced == 0 {
+        return Status.bufferError
+    }
+
+    // Z_FINISH says the caller expects the whole stream to finish in this call, so "call me
+    // again" is not an answer it can act on — the reference turns every Z_OK into Z_BUF_ERROR
+    // under it, and a caller distinguishing a complete stream from a truncated one relies on
+    // exactly that. Not fatal either: the caller can still supply more and ask again.
+    if flush == 4 {
         return Status.bufferError
     }
 
