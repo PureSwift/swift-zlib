@@ -14,7 +14,16 @@
 // is this one with framing around it, and reading that framing belongs to whichever module owns
 // it. ``alignToByte()`` and ``readBits(_:)`` are what such a module reads it *with*, so that a
 // wrapper's fields and the DEFLATE data come off one input stream rather than two.
-public final class Inflate {
+// The state lives in a noncopyable struct and the public class is a box around it, and the
+// split is not cosmetic: it is where a third of the decoder's running time went. A mutating
+// access to a struct stored in a class — every `&self.reader`, every write to a counter — is
+// dynamically checked for exclusivity, once per symbol. The same mutation through `inout self`
+// of a struct is checked statically, at compile time, for free. So the box pays one dynamic
+// access per public call, and the hot loops inside pay none.
+//
+// ~Copyable because the struct owns raw memory: the window is freed in deinit, and a copy that
+// duplicated the pointer would free it twice. Duplication is explicit, via ``copied()``.
+struct InflateCore: ~Copyable {
     private enum State {
         case blockHeader
         case storedLength
@@ -85,9 +94,9 @@ public final class Inflate {
     private var heldLiteral: UInt8?
 
     /// Whether the stream has delivered its end marker.
-    public internal(set) var isFinished = false
+    private(set) var isFinished = false
 
-    public init() {
+    init() {
         self.window = .allocate(capacity: DeflateTables.windowSize)
         self.window.initialize(repeating: 0, count: DeflateTables.windowSize)
     }
@@ -96,11 +105,11 @@ public final class Inflate {
         self.window.deallocate()
     }
 
-    public var needsInput: Bool {
+    var needsInput: Bool {
         self.reader.needsInput
     }
 
-    public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
+    mutating func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         self.reader.setInput(bytes)
     }
 
@@ -115,7 +124,7 @@ public final class Inflate {
     ///
     /// Idempotent, which is what lets a wrapper call it every time it re-enters a trailer it
     /// could not finish reading last time.
-    public func alignToByte() {
+    mutating func alignToByte() {
         self.reader.alignToByte()
     }
 
@@ -123,7 +132,7 @@ public final class Inflate {
     ///
     /// Returns nil, consuming nothing, when that many bits have not arrived — so a wrapper can
     /// retry the identical call once more input has.
-    public func readBits(_ count: Int) -> UInt32? {
+    mutating func readBits(_ count: Int) -> UInt32? {
         self.reader.bits(count)
     }
 
@@ -135,7 +144,7 @@ public final class Inflate {
     /// stream reports itself finished, this is the stream's length to the byte and everything
     /// after it is still the caller's. That is what makes concatenated streams work, and what
     /// lets a caller find the data following one embedded in a larger file.
-    public var pulledInputCount: Int {
+    var pulledInputCount: Int {
         self.reader.pulledByteCount
     }
 
@@ -146,7 +155,7 @@ public final class Inflate {
     /// A preset dictionary: text the encoder assumed was already here, so a distance may reach
     /// into it before this stream has produced anything of its own. Only the last window's
     /// worth is kept, the rest being unreachable by any distance.
-    public func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) {
+    mutating func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) {
         let start = max(0, bytes.count - DeflateTables.windowSize)
 
         for index in start ..< bytes.count {
@@ -161,7 +170,7 @@ public final class Inflate {
 
     /// The most recent window's worth of output, which is what a decoder resuming from here
     /// would need and what `inflateGetDictionary` reports.
-    public var dictionary: [UInt8] {
+    var dictionary: [UInt8] {
         let available = min(self.totalProduced, DeflateTables.windowSize)
         guard available > 0 else { return [] }
 
@@ -178,7 +187,7 @@ public final class Inflate {
     }
 
     /// Puts bits in front of the stream, for a caller that consumed part of it itself.
-    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+    mutating func prime(_ value: UInt32, bits count: Int) -> Bool {
         self.reader.prime(value, bits: count)
     }
 
@@ -188,13 +197,13 @@ public final class Inflate {
     /// spot an empty stored block's header leaves a decoder at, and callers compare against
     /// what the reference answers. At the very start of a stream, or after an ordinary block,
     /// it answers no — there is a boundary there, but not a stored block's.
-    public var isAtSyncPoint: Bool {
+    var isAtSyncPoint: Bool {
         self.state == .storedLength && self.reader.isByteAligned
     }
 
     /// Restarts block decoding from the current position, throwing away whatever partial state
     /// the stream was in. For resynchronising after damage, where the alternative is to stop.
-    public func resumeAtBlockBoundary() {
+    mutating func resumeAtBlockBoundary() {
         self.state = .blockHeader
         self.symbolPartial = HuffmanTable.Partial()
         self.heldLiteral = nil
@@ -203,13 +212,13 @@ public final class Inflate {
     }
 
     /// Reads one byte, for a caller scanning the input itself.
-    public func readByte() -> UInt8? {
+    mutating func readByte() -> UInt8? {
         self.reader.bits(8).map { UInt8(truncatingIfNeeded: $0) }
     }
 
-    /// An independent copy, sharing nothing.
-    public func copy() -> Inflate {
-        let clone = Inflate()
+    /// An explicit duplicate, sharing nothing — the operation ~Copyable exists to make visible.
+    borrowing func copied() -> InflateCore {
+        var clone = InflateCore()
 
         clone.state = self.state
         clone.reader = self.reader
@@ -236,9 +245,14 @@ public final class Inflate {
         clone.matchLength = self.matchLength
         clone.matchDistance = self.matchDistance
         clone.heldLiteral = self.heldLiteral
-        clone.isFinished = self.isFinished
+        clone.setFinished(self.isFinished)
 
         return clone
+    }
+
+    /// For ``copied()`` and the box, `isFinished` being settable only from inside this file.
+    mutating func setFinished(_ value: Bool) {
+        self.isFinished = value
     }
 
     // -- emitting produced bytes ------------------------------------------------
@@ -257,7 +271,7 @@ public final class Inflate {
     /// point it failed, and those bytes are in the caller's buffer. Losing the count with the
     /// error would leave them there unclaimed — which is not merely wasteful: a caller
     /// recovering from damage wants exactly the part that decoded.
-    public var producedInLastCall: Int {
+    var producedInLastCall: Int {
         self.destinationCount
     }
 
@@ -268,7 +282,7 @@ public final class Inflate {
     /// Writes one produced byte to both the caller's buffer and this stream's own window, which
     /// is the only history a later match can read back through — the caller's buffers are not
     /// assumed to stay valid or stay adjacent to each other.
-    private func emit(_ byte: UInt8) {
+    private mutating func emit(_ byte: UInt8) {
         self.destination[self.destinationCount] = byte
         self.destinationCount += 1
 
@@ -285,7 +299,7 @@ public final class Inflate {
     ///
     /// Stops as soon as the final block's end-of-block symbol is read, leaving anything after it
     /// unconsumed for a wrapper to read as its trailer.
-    public func inflate(
+    mutating func inflate(
         into destination: UnsafeMutablePointer<UInt8>,
         count: Int
     ) throws(DeflateError) -> Int {
@@ -309,7 +323,7 @@ public final class Inflate {
     ///
     /// Returns false when nothing more can happen right now — either the input has run out or
     /// the destination has — so the caller's loop above knows to stop rather than spin.
-    private func step() throws(DeflateError) -> Bool {
+    private mutating func step() throws(DeflateError) -> Bool {
         switch self.state {
         case .blockHeader:
             // Read as one field: two separate reads would each be atomic on their own, but
@@ -623,7 +637,7 @@ public final class Inflate {
     /// Nothing is read past the end-of-block symbol: whatever follows is either the next block's
     /// header, which the next step reads, or a wrapper's trailer, which is not this module's to
     /// interpret.
-    private func endBlock() {
+    private mutating func endBlock() {
         guard self.isFinalBlock else {
             self.state = .blockHeader
             return
@@ -636,7 +650,7 @@ public final class Inflate {
     /// The two repeat codes in the code-length alphabet: 16 copies the previous length again,
     /// 17 and 18 insert runs of zero — three different symbols for what is, underneath, the same
     /// "extend the array by `count` entries" operation.
-    private func repeatPreviousLength(count: Int) throws(DeflateError) {
+    private mutating func repeatPreviousLength(count: Int) throws(DeflateError) {
         guard self.combinedLengthsIndex > 0 else {
             throw DeflateError("repeat code with nothing to repeat")
         }
@@ -644,12 +658,12 @@ public final class Inflate {
         try self.fill(self.previousCodeLength, count: count)
     }
 
-    private func fillZeroLength(count: Int) throws(DeflateError) {
+    private mutating func fillZeroLength(count: Int) throws(DeflateError) {
         try self.fill(0, count: count)
         self.previousCodeLength = 0
     }
 
-    private func fill(_ value: UInt8, count: Int) throws(DeflateError) {
+    private mutating func fill(_ value: UInt8, count: Int) throws(DeflateError) {
         guard self.combinedLengthsIndex + count <= self.combinedLengths.count else {
             throw DeflateError("code-length repeat runs past the table")
         }
@@ -658,5 +672,45 @@ public final class Inflate {
             self.combinedLengths[self.combinedLengthsIndex] = value
             self.combinedLengthsIndex += 1
         }
+    }
+}
+
+
+/// The public face: a reference type over ``InflateCore``, because that is what the streaming
+/// contract wants — a stream is one thing with identity that several stages of a pipeline hand
+/// around, not a value to be copied. The box costs one dynamically checked access per call;
+/// everything under it is checked statically.
+public final class Inflate {
+    var core = InflateCore()
+
+    public init() {}
+
+    public var needsInput: Bool { self.core.needsInput }
+    public var isFinished: Bool { self.core.isFinished }
+    public var pulledInputCount: Int { self.core.pulledInputCount }
+    public var producedInLastCall: Int { self.core.producedInLastCall }
+    public var dictionary: [UInt8] { self.core.dictionary }
+    public var isAtSyncPoint: Bool { self.core.isAtSyncPoint }
+
+    public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) { self.core.setInput(bytes) }
+    public func alignToByte() { self.core.alignToByte() }
+    public func readBits(_ count: Int) -> UInt32? { self.core.readBits(count) }
+    public func readByte() -> UInt8? { self.core.readByte() }
+    public func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) { self.core.primeWindow(bytes) }
+    public func prime(_ value: UInt32, bits count: Int) -> Bool { self.core.prime(value, bits: count) }
+    public func resumeAtBlockBoundary() { self.core.resumeAtBlockBoundary() }
+
+    public func inflate(
+        into destination: UnsafeMutablePointer<UInt8>,
+        count: Int
+    ) throws(DeflateError) -> Int {
+        try self.core.inflate(into: destination, count: count)
+    }
+
+    /// An independent copy, sharing nothing.
+    public func copy() -> Inflate {
+        let clone = Inflate()
+        clone.core = self.core.copied()
+        return clone
     }
 }
