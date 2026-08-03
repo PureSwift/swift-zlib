@@ -207,6 +207,26 @@ struct GZipTests {
         }
     }
 
+    /// A header is wrong at the byte that is wrong, and a caller holding only that much of it
+    /// is entitled to be told so rather than to wait for ten bytes that will never come.
+    @Test("A bad header is refused on the byte that is bad")
+    func rejectsEarly() throws {
+        // Three bytes: magic, then a method that does not exist.
+        #expect(throws: DeflateError.self) {
+            _ = try Self.inflate([0x1F, 0x8B, 0x00])
+        }
+
+        // Four bytes: magic, deflate, then reserved flag bits set.
+        #expect(throws: DeflateError.self) {
+            _ = try Self.inflate([0x1F, 0x8B, 0x08, 0x80])
+        }
+
+        // One byte, and already not a gzip member.
+        #expect(throws: DeflateError.self) {
+            _ = try Self.inflate([0x1E])
+        }
+    }
+
     @Test("Reserved flags are refused")
     func reservedFlags() throws {
         #expect(throws: DeflateError.self) {
