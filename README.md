@@ -129,6 +129,19 @@ expressible in `Package.swift`.
 
 ### What is verified
 
+**zlib's own test programs**, built against this library unmodified: `test/example.c` passes
+in full — including `inflateSync` recovery and preset dictionaries — with output identical to
+the reference's, and `test/minigzip.c` round-trips in all three directions (ours to ours, ours
+to the reference, the reference to ours).
+
+**Differential fuzzing of inflate**, which is where zlib's CVEs have been. 6000 streams —
+intact, bit-flipped, truncated, byte-smashed and pure noise, across zlib, raw, gzip and
+auto-detect framing — generated once by the reference so both libraries decode identical
+bytes. **The accept/reject verdict matches on every one, and every accepted stream decodes to
+identical bytes.** One stream salvages a different number of pre-error bytes, which is a
+judgement two decoders may make differently.
+
+
 - The built library exports **exactly** the reference's 88 symbols under the reference's own
   version nodes — nothing missing, and none of the ~190 Swift symbols a naive link leaks.
 - Two conformance programs, each compiled twice — against the reference and against this
