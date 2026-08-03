@@ -34,6 +34,15 @@ final class InflateStream {
     var wrapper: Wrapper
     var windowBits: Int32
 
+    /// What the caller actually asked for, before it was normalised. Zero means "take the
+    /// window from the stream's own header", which is a different instruction from fifteen.
+    var requestedWindowBits: Int32 = 15
+
+    /// The largest window a zlib stream may declare, or nil when the caller left it open.
+    private var windowLimit: Int32? {
+        self.requestedWindowBits == 0 ? nil : self.windowBits
+    }
+
     /// Set once the stream has reported `Z_STREAM_END`, so that calling again is a no-op rather
     /// than a second attempt at a finished stream.
     var ended = false
@@ -61,6 +70,7 @@ final class InflateStream {
         }
 
         clone.ended = self.ended
+        clone.requestedWindowBits = self.requestedWindowBits
         clone.validatesChecksum = self.validatesChecksum
         clone.syncMatched = self.syncMatched
 
@@ -75,17 +85,18 @@ final class InflateStream {
     init(wrapper: Wrapper, windowBits: Int32) {
         self.wrapper = wrapper
         self.windowBits = windowBits
-        self.engine = Self.engine(for: wrapper)
+        self.engine = .undecided
+        self.engine = self.makeEngine(for: wrapper)
     }
 
     func reset() {
-        self.engine = Self.engine(for: self.wrapper)
+        self.engine = self.makeEngine(for: self.wrapper)
         self.ended = false
     }
 
-    private static func engine(for wrapper: Wrapper) -> Engine {
+    private func makeEngine(for wrapper: Wrapper) -> Engine {
         switch wrapper {
-        case .zlib: return .zlib(Zlib.Decompressor())
+        case .zlib: return .zlib(Zlib.Decompressor(maximumWindowBits: self.windowLimit))
         case .gzip: return .gzip(GZip.Decompressor())
         case .raw: return .raw(Inflate())
         case .detect: return .undecided
@@ -101,7 +112,7 @@ final class InflateStream {
     func decide(from first: UInt8) {
         self.engine = first == 0x1F
             ? .gzip(GZip.Decompressor())
-            : .zlib(Zlib.Decompressor())
+            : .zlib(Zlib.Decompressor(maximumWindowBits: self.windowLimit))
     }
 
     var isUndecided: Bool {
@@ -200,7 +211,11 @@ public func inflateInit2_(
     strm.pointee.adler = 1
     strm.pointee.data_type = 2 // Z_UNKNOWN, until the stream says otherwise.
 
-    attach(InflateStream(wrapper: wrapper, windowBits: bits), to: strm)
+    let state = InflateStream(wrapper: wrapper, windowBits: bits)
+    state.requestedWindowBits = windowBits
+    state.reset()
+
+    attach(state, to: strm)
 
     return Status.ok
 }
@@ -384,6 +399,7 @@ public func inflateReset2(_ strm: z_streamp!, _ windowBits: Int32) -> Int32 {
 
     state.wrapper = wrapper
     state.windowBits = bits
+    state.requestedWindowBits = windowBits
 
     return inflateReset(strm)
 }
