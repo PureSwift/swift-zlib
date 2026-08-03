@@ -48,20 +48,29 @@ struct DynamicBlockTests {
 
             #expect(lengths.allSatisfy { $0 <= 15 })
 
-            // Every symbol that occurs must have a code, and every symbol that does not, must
-            // not: a code spent on an absent symbol is a code taken from a present one.
-            for symbol in frequencies.indices {
-                #expect((lengths[symbol] > 0) == (frequencies[symbol] > 0))
+            // Every symbol that occurs must have a code. The converse holds except in the
+            // one-symbol case, where a second code is handed out on purpose to keep the table
+            // complete — so what is asserted is that no *occurring* symbol is left out.
+            for symbol in frequencies.indices where frequencies[symbol] > 0 {
+                #expect(lengths[symbol] > 0)
             }
 
+            // Exactly filling the code space, not merely staying inside it. A table that
+            // leaves part of it unclaimed has bit patterns decoding to nothing, and a decoder
+            // that refuses those — as this module's and the reference's both do — rejects any
+            // stream carrying one.
             let sum = Self.kraftSum(lengths, maxBits: 15)
-            #expect(sum <= 1.0000001, "over-subscribed table on trial \(trial): \(sum)")
+            #expect(abs(sum - 1.0) < 0.0000001, "table does not fill the code space: \(sum)")
         }
     }
 
-    /// One symbol is a real case — a block of nothing but end-of-block — and the format requires
-    /// it to be written with one bit rather than none.
-    @Test("A single symbol gets a one-bit code")
+    /// One symbol is a real case — a block of nothing but end-of-block — and it gets *two*
+    /// one-bit codes rather than one.
+    ///
+    /// One would be legal for the distance alphabet and is not legal for the code-length
+    /// alphabet, and a decoder that refuses incomplete tables rejects a stream carrying one.
+    /// The spare code costs a bit that never appears in the output.
+    @Test("A single symbol still yields a complete table")
     func singleSymbol() throws {
         var frequencies = [Int](repeating: 0, count: 286)
         frequencies[256] = 1
@@ -69,7 +78,15 @@ struct DynamicBlockTests {
         let lengths = HuffmanBuilder.lengths(frequencies: frequencies, maxBits: 15)
 
         #expect(lengths[256] == 1)
-        #expect(lengths.filter { $0 > 0 }.count == 1)
+        #expect(lengths.filter { $0 > 0 }.count == 2)
+        #expect(abs(Self.kraftSum(lengths, maxBits: 15) - 1.0) < 0.0000001)
+    }
+
+    /// An empty block is the case that produces a one-symbol alphabet in practice, so it is
+    /// worth checking end to end rather than only at the table.
+    @Test("An empty block round-trips")
+    func emptyBlock() throws {
+        #expect(try DeflateTests.roundTrip([], level: 6) == [])
     }
 
     /// Canonical codes have to be distinct, and assigned shortest-first in symbol order, since
