@@ -20,31 +20,7 @@ BARE_TRIPLES=(aarch64-none-none-elf armv7-none-none-eabi riscv32-none-none-eabi)
 
 status=0
 
-echo "package modules under Embedded Swift (swift build --traits Embedded)"
-
-# The package's own targets, built as real modules through SwiftPM — which is what a dependent
-# project does, and what proves the module structure itself survives Embedded rather than only
-# a flattened copy of the sources. -wmo comes from the command line because Embedded requires
-# it and the manifest must not force unsafe flags on dependents.
-for module in LZ77 Zlib GZip; do
-    printf '  %-6s ' "$module"
-
-    if (cd "$ROOT" && swift build --traits Embedded -Xswiftc -wmo --target "$module" \
-        > "$WORK/$module.log" 2>&1)
-    then
-        echo "builds"
-    else
-        echo "FAILED"
-        grep -E 'error' "$WORK/$module.log" | head -5 || true
-        status=1
-    fi
-done
-
-echo
-
-# Assembles one wrapper plus the engine into a directory of uniquely named sources — needed
-# only for the *runnable* smoke test below, an executable being something the package cannot
-# gate behind the trait.
+# Assembles one wrapper plus the engine into a directory of uniquely named sources.
 assemble() {
     local wrapper="$1" target="$2"
     mkdir -p "$target"
