@@ -8,14 +8,15 @@
 // member. A stream needing one of those wrappers is this stream with framing around it, and
 // framing is the wrapping module's business; see the `Zlib` module for the RFC 1950 case.
 //
-// Blocks are either stored (§3.2.4) or fixed-Huffman (§3.2.6) over LZ77 matches found with a
-// hash chain, whichever is smaller for the block at hand. Dynamic blocks are the deliberate
-// omission: they need a table built and sent, which is most of the code and nearly all of the
-// memory a full encoder wants, and on the targets this module exists to serve — a WASM sandbox,
-// a microcontroller — that trade is the right way round. The output is a valid DEFLATE stream
-// that any decoder reads; it is simply a few per cent larger than what a dynamic-block encoder
-// would emit. Adding them later changes only what this file writes, not what anything else
-// here assumes.
+// Every block is written as stored (§3.2.4), fixed-Huffman (§3.2.6) or dynamic-Huffman
+// (§3.2.7) over LZ77 matches found with a hash chain — whichever of the three is smallest for
+// the block at hand, decided by costing all three rather than by guessing from the input.
+//
+// The three exist because none dominates. Stored wins on data with no structure, where any
+// coding costs more than it saves. Dynamic wins on almost everything else, because a table
+// fitted to the block pays for itself many times over. Fixed wins in the narrow band between
+// them, on blocks too small for a table to be worth sending — which is most of what a caller
+// flushing frequently produces.
 //
 // Matching is the standard hash-chain arrangement: a rolling three-byte hash indexes the most
 // recent position with that hash, each of which links to the previous one, so the search walks
@@ -83,9 +84,14 @@ public final class Deflate {
     /// block writes out and therefore what cannot be trimmed away while the block is open.
     private var blockStart = 0
 
-    /// What the open block's symbols would cost as fixed Huffman, in bits, accumulated as they
-    /// are appended so that closing the block is a comparison rather than a second pass.
-    private var blockCostBits = 0
+    /// How often each symbol occurs in the open block, which is what a dynamic block's tables
+    /// are fitted to and what all three block types are costed from.
+    private var literalFrequencies = [Int](repeating: 0, count: 286)
+    private var distanceFrequencies = [Int](repeating: 0, count: 30)
+
+    /// Bits spent on the extra-bits fields of the block's matches. The same for every block
+    /// type, since extra bits are written raw whichever coding is chosen.
+    private var extraBits = 0
 
     /// A stored block's length is a sixteen-bit field, so a block that might become one cannot
     /// cover more input than that.
@@ -333,7 +339,7 @@ public final class Deflate {
 
     private func appendLiteral(_ byte: UInt8) {
         self.symbols.append(UInt32(byte))
-        self.blockCostBits += Self.literalOrLengthBits(UInt16(byte))
+        self.literalFrequencies[Int(byte)] += 1
     }
 
     private func appendMatch(length: Int, distance: Int) {
@@ -344,10 +350,11 @@ public final class Deflate {
         let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
         let distanceSymbol = Self.distanceSymbol(for: distance)
 
-        self.blockCostBits +=
-            Self.literalOrLengthBits(UInt16(257 + lengthSymbol))
-            + DeflateTables.lengthExtraBits[lengthSymbol]
-            + 5
+        self.literalFrequencies[257 + lengthSymbol] += 1
+        self.distanceFrequencies[distanceSymbol] += 1
+
+        self.extraBits +=
+            DeflateTables.lengthExtraBits[lengthSymbol]
             + DeflateTables.distanceExtraBits[distanceSymbol]
     }
 
@@ -381,14 +388,25 @@ public final class Deflate {
     private func flushBlock(final: Bool) {
         let storedLength = self.cursor - self.blockStart
 
-        // Fixed costs three bits of header and seven for end-of-block on top of its symbols.
-        // Stored costs three of header, up to seven of padding to reach a byte boundary, and
-        // then four bytes of length and complement before the data itself.
-        let fixedBits = 3 + self.blockCostBits + 7
+        // Every block ends with one, and it has to be counted before the tables are fitted or
+        // the symbol that always occurs would be the one left out of them.
+        self.literalFrequencies[Int(DeflateTables.endOfBlock)] += 1
+
+        // Three bits of header, then what each coding spends. Stored also pays up to seven bits
+        // of padding to reach a byte boundary and four bytes of length and complement.
+        let fixedBits = 3 + self.fixedCostBits()
         let storedBits = 3 + 7 + 32 + storedLength * 8
 
-        if storedLength <= Self.maxBlockBytes, storedBits < fixedBits {
+        let dynamic = DynamicBlock(
+            literalFrequencies: self.literalFrequencies,
+            distanceFrequencies: self.distanceFrequencies,
+            extraBits: self.extraBits
+        )
+
+        if storedLength <= Self.maxBlockBytes, storedBits <= min(fixedBits, dynamic.totalBits) {
             self.writeStoredBlock(final: final, length: storedLength)
+        } else if dynamic.totalBits < fixedBits {
+            self.writeDynamicBlock(final: final, table: dynamic)
         } else {
             self.writeFixedBlock(final: final)
         }
@@ -401,8 +419,27 @@ public final class Deflate {
         }
 
         self.symbols.removeAll(keepingCapacity: true)
-        self.blockCostBits = 0
+        self.extraBits = 0
         self.blockStart = self.cursor
+
+        for index in self.literalFrequencies.indices { self.literalFrequencies[index] = 0 }
+        for index in self.distanceFrequencies.indices { self.distanceFrequencies[index] = 0 }
+    }
+
+    /// What this block's symbols would cost under §3.2.6's fixed alphabet.
+    private func fixedCostBits() -> Int {
+        var bits = self.extraBits
+
+        for symbol in self.literalFrequencies.indices where self.literalFrequencies[symbol] > 0 {
+            bits += self.literalFrequencies[symbol] * Self.literalOrLengthBits(UInt16(symbol))
+        }
+
+        for symbol in self.distanceFrequencies.indices {
+            // Every distance code is five bits in the fixed alphabet.
+            bits += self.distanceFrequencies[symbol] * 5
+        }
+
+        return bits
     }
 
     /// An empty stored block, which is how a stream reaches a byte boundary mid-flight.
@@ -454,6 +491,61 @@ public final class Deflate {
         }
 
         self.writeLiteralOrLength(DeflateTables.endOfBlock)
+    }
+
+    private func writeDynamicBlock(final: Bool, table: DynamicBlock) {
+        self.writer.write(final ? 1 : 0, bits: 1)
+        self.writer.write(2, bits: 2)
+
+        table.writeTable(to: &self.writer)
+
+        for symbol in self.symbols {
+            guard symbol & 0x8000_0000 != 0 else {
+                let literal = Int(symbol & 0xFF)
+                self.writer.writeCode(
+                    table.literalCodes[literal],
+                    bits: Int(table.literalLengths[literal])
+                )
+                continue
+            }
+
+            let length = Int(symbol & 0x1FF)
+            let distance = Int((symbol >> 9) & 0xFFFF)
+
+            let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
+            self.writer.writeCode(
+                table.literalCodes[257 + lengthSymbol],
+                bits: Int(table.literalLengths[257 + lengthSymbol])
+            )
+
+            let lengthExtra = DeflateTables.lengthExtraBits[lengthSymbol]
+            if lengthExtra > 0 {
+                self.writer.write(
+                    UInt32(length - DeflateTables.lengthBase[lengthSymbol]),
+                    bits: lengthExtra
+                )
+            }
+
+            let distanceSymbol = Self.distanceSymbol(for: distance)
+            self.writer.writeCode(
+                table.distanceCodes[distanceSymbol],
+                bits: Int(table.distanceLengths[distanceSymbol])
+            )
+
+            let distanceExtra = DeflateTables.distanceExtraBits[distanceSymbol]
+            if distanceExtra > 0 {
+                self.writer.write(
+                    UInt32(distance - DeflateTables.distanceBase[distanceSymbol]),
+                    bits: distanceExtra
+                )
+            }
+        }
+
+        let endOfBlock = Int(DeflateTables.endOfBlock)
+        self.writer.writeCode(
+            table.literalCodes[endOfBlock],
+            bits: Int(table.literalLengths[endOfBlock])
+        )
     }
 
     // -- fixed-Huffman symbol emission ------------------------------------------
