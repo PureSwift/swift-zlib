@@ -84,6 +84,28 @@ struct BitReader {
         return UInt32(truncatingIfNeeded: value)
     }
 
+    /// Puts `count` bits in front of whatever is read next.
+    ///
+    /// For a caller that has already consumed part of a stream by itself and wants this reader
+    /// to carry on from the middle of a byte — which is what `inflatePrime` is for. Returns
+    /// false when there is not room, the buffer holding sixty-four bits at most.
+    mutating func prime(_ value: UInt32, bits count: Int) -> Bool {
+        guard count >= 0, count <= 32, self.bitCount + count <= 64 else { return false }
+
+        let mask: UInt64 = count == 0 ? 0 : (~UInt64(0) >> (64 - count))
+
+        // Ahead of what is already buffered, so the primed bits are read first.
+        self.buffer = (self.buffer << count) | (UInt64(value) & mask)
+        self.bitCount += count
+
+        return true
+    }
+
+    /// Whether the reader sits on a byte boundary with nothing part-read.
+    var isByteAligned: Bool {
+        self.bitCount % 8 == 0
+    }
+
     /// Drops whatever is left of the current byte, so the next read starts on a byte boundary.
     ///
     /// A stored block is byte-aligned data with no bit packing, and this is what gets a reader
