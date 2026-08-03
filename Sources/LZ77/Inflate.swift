@@ -236,6 +236,16 @@ public final class Inflate {
     private var destinationCapacity = 0
     private var destinationCount = 0
 
+    /// How many bytes the last call wrote, whether it returned or threw.
+    ///
+    /// Needed because a stream that fails partway has still produced everything up to the
+    /// point it failed, and those bytes are in the caller's buffer. Losing the count with the
+    /// error would leave them there unclaimed — which is not merely wasteful: a caller
+    /// recovering from damage wants exactly the part that decoded.
+    public var producedInLastCall: Int {
+        self.destinationCount
+    }
+
     private var destinationFull: Bool {
         self.destinationCount >= self.destinationCapacity
     }
@@ -414,11 +424,15 @@ public final class Inflate {
                 }
             }
 
+            // These two alphabets may be §3.2.7's permitted single one-bit code; the
+            // code-length alphabet built above may not, and is checked without the exemption.
             self.literalTable = try HuffmanTable(
-                lengths: Array(self.combinedLengths[0 ..< self.literalCount])
+                lengths: Array(self.combinedLengths[0 ..< self.literalCount]),
+                allowingIncomplete: true
             )
             self.distanceTable = try HuffmanTable(
-                lengths: Array(self.combinedLengths[self.literalCount...])
+                lengths: Array(self.combinedLengths[self.literalCount...]),
+                allowingIncomplete: true
             )
             self.symbolPartial = HuffmanTable.Partial()
             self.state = .blockData
