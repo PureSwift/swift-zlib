@@ -49,7 +49,7 @@ public final class Deflate {
         }
     }
 
-    private let effort: Effort
+    private var effort: Effort
 
     /// Everything handed in but not yet compressed, plus the window of already-compressed bytes
     /// a match may still reach back into. Trimmed from the front once the history behind the
@@ -142,7 +142,7 @@ public final class Deflate {
     /// A caller limits this when whatever will decompress the result has less than 32 KiB to
     /// spare. Emitting a distance beyond what the stream declares produces something the
     /// intended decoder cannot read, so this is a limit on the encoder rather than a hint to it.
-    private let windowSize: Int
+    private var windowSize: Int
 
     /// - Parameter windowBits: the base-two logarithm of the window, 9 through 15.
     public init(level: Int32, windowBits: Int32 = 15) {
@@ -150,6 +150,101 @@ public final class Deflate {
         self.head = [Int](repeating: -1, count: Self.hashSize)
         self.chain = []
         self.windowSize = 1 << max(9, min(15, Int(windowBits)))
+    }
+
+    // -- what a caller can change or carry over ------------------------------------
+
+    /// Changes how hard the match search works, from here on.
+    ///
+    /// Safe mid-stream because a level is not recorded anywhere in the format: it changes what
+    /// this encoder chooses, never how a decoder reads the result. Blocks compressed at
+    /// different levels sit side by side in one stream quite happily.
+    public func setLevel(_ level: Int32) {
+        self.effort = Effort.forLevel(level)
+    }
+
+    /// Sets the match search's knobs directly, which is what `deflateTune` exists for.
+    public func tune(goodMatch: Int, maxLazy: Int, maxChainLength: Int) {
+        self.effort = Effort(
+            maxChainLength: max(0, maxChainLength),
+            goodMatch: max(0, goodMatch),
+            maxLazy: max(0, maxLazy)
+        )
+    }
+
+    /// Fills the window with bytes that are not part of the output.
+    ///
+    /// A preset dictionary: text the decoder is assumed to have already, so matches may point
+    /// into it from the very first byte. Nothing here is emitted — the cursor and the block both
+    /// start past it — which is exactly what makes it a dictionary rather than a prefix.
+    ///
+    /// Only the last window's worth can be reached by a distance, so anything before that is
+    /// dropped rather than kept and never used.
+    public func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) {
+        guard !bytes.isEmpty, self.pending.isEmpty else { return }
+
+        let start = max(0, bytes.count - self.windowSize)
+        let slice = UnsafeBufferPointer(
+            start: bytes.baseAddress! + start,
+            count: bytes.count - start
+        )
+
+        self.pending.append(contentsOf: slice)
+        self.chain.append(contentsOf: [Int](repeating: -1, count: slice.count))
+
+        // Hashed so matches can find it, then stepped over: these bytes are context, not input.
+        for position in 0 ..< self.pending.count {
+            self.insert(at: position)
+        }
+
+        self.cursor = self.pending.count
+        self.blockStart = self.cursor
+    }
+
+    /// The most recent window's worth of bytes seen, which is what a decoder would need to
+    /// continue from here and what `deflateGetDictionary` reports.
+    public var dictionary: [UInt8] {
+        let end = self.emittedEnd
+        let start = max(0, end - self.windowSize)
+
+        return Array(self.pending[start ..< end])
+    }
+
+    /// Puts `count` bits into the output ahead of the stream.
+    ///
+    /// Only before anything has been written, because there is nowhere else they could go: the
+    /// point is to let a caller prepend framing of its own to a stream this produces.
+    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+        guard self.writer.isEmpty, count >= 0, count <= 32 else { return false }
+
+        self.writer.write(value, bits: count)
+        return true
+    }
+
+    /// An independent copy, sharing nothing.
+    ///
+    /// Every field is a value type, so this is a memberwise copy and not a traversal: the point
+    /// of saying so is that adding a reference-typed field later would silently make the two
+    /// copies share it.
+    public func copy() -> Deflate {
+        let clone = Deflate(level: 6, windowBits: 15)
+
+        clone.effort = self.effort
+        clone.windowSize = self.windowSize
+        clone.pending = self.pending
+        clone.cursor = self.cursor
+        clone.head = self.head
+        clone.chain = self.chain
+        clone.writer = self.writer
+        clone.symbols = self.symbols
+        clone.blockStart = self.blockStart
+        clone.deferred = self.deferred
+        clone.literalFrequencies = self.literalFrequencies
+        clone.distanceFrequencies = self.distanceFrequencies
+        clone.extraBits = self.extraBits
+        clone.streamEnded = self.streamEnded
+
+        return clone
     }
 
     /// Whether this encoder is ready to be given more input.
@@ -177,6 +272,10 @@ public final class Deflate {
     public enum Ending {
         case none
         case flush
+        /// A flush that also empties the window, so nothing after it refers to anything before
+        /// it. That independence is the point: a reader that lost its place — or never had it,
+        /// having joined mid-stream — can start at the marker and decode everything after.
+        case fullFlush
         case finish
     }
 
@@ -207,6 +306,12 @@ public final class Deflate {
                 self.resolveDeferred()
                 self.flushBlock(final: false)
                 self.writeSyncMarker()
+
+            case .fullFlush:
+                self.resolveDeferred()
+                self.flushBlock(final: false)
+                self.writeSyncMarker()
+                self.resetWindow()
 
             case .finish:
                 if !self.streamEnded {
@@ -512,6 +617,21 @@ public final class Deflate {
         }
 
         return bits
+    }
+
+    /// Empties the window, so no later match reaches anything earlier.
+    ///
+    /// At the point this is called everything pending has been consumed and every block
+    /// flushed, so what is dropped is pure history.
+    private func resetWindow() {
+        self.pending.removeAll(keepingCapacity: true)
+        self.chain.removeAll(keepingCapacity: true)
+        self.cursor = 0
+        self.blockStart = 0
+
+        for index in self.head.indices {
+            self.head[index] = -1
+        }
     }
 
     /// An empty stored block, which is how a stream reaches a byte boundary mid-flight.
