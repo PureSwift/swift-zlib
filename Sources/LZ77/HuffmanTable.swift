@@ -13,11 +13,16 @@
 // the table, and every value along the way is either a valid shorter code or an unused prefix,
 // never both, which is what makes a prefix code decodable without a separator.
 //
-// This is table lookup by arithmetic rather than by array, which keeps memory to one entry per
-// symbol rather than one per possible bit pattern — the entries an embedded target can spare are
-// few enough that the difference matters, and decoding one bit at a time rather than several is
-// the trade made for it. A faster table-driven decode is possible later without changing what
-// this reports.
+// Two decoders, over the same lengths. The arithmetic one below walks a bit at a time and needs
+// one entry per symbol; the lookup one resolves a short code in a single indexing operation, at
+// the cost of one entry per bit pattern up to its root length. Short codes are the common case
+// by construction — that is what Huffman coding is — so the table answers most symbols, and the
+// arithmetic path answers the long tail and every symbol near the end of the input, where there
+// may not be enough bits buffered to index with.
+//
+// The lookup table is indexed by the bits in the order the stream delivers them, least
+// significant first, which is the reverse of the order a code is defined in. Reversing once when
+// the table is built is what saves reversing on every symbol decoded.
 struct HuffmanTable {
     static let maxBits = 15
 
@@ -32,6 +37,18 @@ struct HuffmanTable {
     private let count: [Int]
 
     private let symbols: [UInt16]
+
+    /// How many bits the lookup table is indexed by. Nine covers the fixed alphabet's literals
+    /// and, in practice, most of a fitted one — past that the table doubles in size for a
+    /// shrinking share of the symbols.
+    static let fastBits = 9
+
+    /// One entry per bit pattern: the code's length in the top four bits and its symbol in the
+    /// low nine, or zero where no code of `fastBits` or fewer begins with that pattern.
+    ///
+    /// Zero is unambiguous as "no entry" because a real entry always carries a length of at
+    /// least one, and so is never zero whatever its symbol.
+    private let fast: [UInt16]
 
     /// Builds the table from one code length per symbol; a length of zero means the symbol is
     /// not in this alphabet at all.
@@ -110,6 +127,40 @@ struct HuffmanTable {
         self.firstSymbolIndex = firstSymbolIndexByLength
         self.count = blCount
         self.symbols = symbolsByPosition
+
+        // Every pattern whose low `length` bits are this code maps to it, whatever the bits
+        // above — those belong to whatever symbol comes next and are left in the reader.
+        var fast = [UInt16](repeating: 0, count: 1 << Self.fastBits)
+        var assigned = nextCode
+
+        for (symbol, length) in lengths.enumerated() where length > 0 && length <= Self.fastBits {
+            let code = assigned[Int(length)]
+            assigned[Int(length)] += 1
+
+            let reversed = Self.reversed(code, bits: Int(length))
+            let entry = UInt16(length) << 12 | UInt16(symbol)
+            let step = 1 << Int(length)
+
+            var index = Int(reversed)
+            while index < fast.count {
+                fast[index] = entry
+                index += step
+            }
+        }
+
+        self.fast = fast
+    }
+
+    /// A code is defined most significant bit first and arrives least significant bit first, so
+    /// the table is indexed by the code turned around.
+    private static func reversed(_ code: UInt32, bits: Int) -> UInt32 {
+        var reversed: UInt32 = 0
+
+        for index in 0 ..< bits {
+            reversed |= ((code >> (bits - 1 - index)) & 1) << index
+        }
+
+        return reversed
     }
 
     /// One symbol as it is decoded, a bit at a time, so a call that ran out of input can pick up
@@ -129,6 +180,18 @@ struct HuffmanTable {
     /// `partial` is reset to empty when a symbol completes; a caller starting a new symbol
     /// passes a fresh `Partial()`.
     func decode(_ reader: inout BitReader, partial: inout Partial) throws(DeflateError) -> DecodeResult {
+        // The table only answers a symbol started from nothing, and only when there are enough
+        // bits buffered to index with. Mid-symbol, or near the end of the input, the arithmetic
+        // path below picks it up — which is also what keeps a resumed decode correct.
+        if partial.length == 0, reader.ensure(Self.fastBits) {
+            let entry = self.fast[Int(reader.peek(Self.fastBits))]
+
+            if entry != 0 {
+                reader.drop(Int(entry >> 12))
+                return .symbol(entry & 0x1FF)
+            }
+        }
+
         while partial.length < Self.maxBits {
             guard let bit = reader.bits(1) else { return .needsInput }
 
