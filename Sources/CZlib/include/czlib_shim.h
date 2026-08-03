@@ -30,6 +30,5 @@
 #endif
 
 #include "zlib.h"
-#include "zlib_internal.h"
 
 #endif /* SWIFTZLIB_SHIM_H */

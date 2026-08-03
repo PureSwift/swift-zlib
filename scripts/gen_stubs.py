@@ -140,6 +140,10 @@ def main():
         " * One definition per exported symbol that is not implemented yet, so the library",
         " * always resolves its whole API and a gap is reported rather than discovered as a",
         " * missing symbol at load time.",
+        " *",
+        " * Every symbol is implemented, so this file is empty. It stays in the build because",
+        " * the generator is the guard: a name added to symbols.txt without an implementation",
+        " * reappears here and fails the covered-count check below.",
         " */",
         "",
         '#include "czlib_shim.h"',
@@ -147,6 +151,24 @@ def main():
     ]
 
     stubbed = []
+    pending = [
+        name for name in sorted(exported)
+        if name not in implemented and name not in HAND_WRITTEN and name in declarations
+    ]
+
+    # The reporter is generated with the stubs that call it, and only then: with the surface
+    # complete it would be dead weight in the shared object, and a symbol nothing references.
+    if pending:
+        lines.extend([
+            "#include <stdio.h>",
+            "",
+            "static void swiftzlib_report_unimplemented(const char *name) {",
+            '    fprintf(stderr, "swift-zlib: %s is not implemented yet; returning an error.\\n",',
+            "            name);",
+            "}",
+            "",
+        ])
+
     for name in sorted(exported):
         if name in implemented or name in HAND_WRITTEN:
             continue

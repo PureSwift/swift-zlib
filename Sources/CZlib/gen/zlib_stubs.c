@@ -3,6 +3,10 @@
  * One definition per exported symbol that is not implemented yet, so the library
  * always resolves its whole API and a gap is reported rather than discovered as a
  * missing symbol at load time.
+ *
+ * Every symbol is implemented, so this file is empty. It stays in the build because
+ * the generator is the guard: a name added to symbols.txt without an implementation
+ * reappears here and fails the covered-count check below.
  */
 
 #include "czlib_shim.h"
