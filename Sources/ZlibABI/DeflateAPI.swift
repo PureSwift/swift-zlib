@@ -25,6 +25,25 @@ final class DeflateStream {
     /// Set once the stream has reported `Z_STREAM_END`.
     var ended = false
 
+    /// An independent copy, sharing nothing.
+    func copy() -> DeflateStream {
+        let clone = DeflateStream(
+            level: self.level,
+            wrapper: self.wrapper,
+            windowBits: self.windowBits
+        )
+
+        switch self.engine {
+        case let .zlib(compressor): clone.engine = .zlib(compressor.copy())
+        case let .gzip(compressor): clone.engine = .gzip(compressor.copy())
+        case let .raw(deflate): clone.engine = .raw(deflate.copy())
+        }
+
+        clone.ended = self.ended
+
+        return clone
+    }
+
     init(level: Int32, wrapper: Wrapper, windowBits: Int32) {
         self.level = level
         self.wrapper = wrapper
@@ -179,15 +198,21 @@ public func deflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
         state.setInput(UnsafeBufferPointer(start: next, count: available))
     }
 
-    let ending: Deflate.Ending
+    let requested: Deflate.Ending
     switch flush {
-    case 4: ending = .finish                    // Z_FINISH
-    case 2, 3: ending = .flush                  // Z_SYNC_FLUSH, Z_FULL_FLUSH
-    default: ending = .none
+    case 4: requested = .finish                 // Z_FINISH
+    case 3: requested = .fullFlush              // Z_FULL_FLUSH
+    case 1, 2: requested = .flush               // Z_PARTIAL_FLUSH, Z_SYNC_FLUSH
+    default: requested = .none
     }
 
     var produced = 0
     let capacity = Int(strm.pointee.avail_out)
+
+    // A flush is asked for once and then drained: asking on every turn of the loop would emit
+    // another empty block and another marker each time, and since each one is output, the loop
+    // would fill any buffer it was given with markers.
+    var ending = requested
 
     do {
         while produced < capacity {
@@ -198,7 +223,12 @@ public func deflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
             )
 
             produced += made
+
             if made == 0 { break }
+
+            if ending == .flush || ending == .fullFlush {
+                ending = .none
+            }
         }
     } catch {
         setMessage(strm, zError(Status.streamError))
@@ -221,7 +251,7 @@ public func deflate(_ strm: z_streamp!, _ flush: Int32) -> Int32 {
         strm.pointee.adler = UInt(checksum)
     }
 
-    if ending == .finish, state.isFinished {
+    if requested == .finish, state.isFinished {
         state.ended = true
         return Status.streamEnd
     }
