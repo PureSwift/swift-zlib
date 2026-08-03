@@ -84,7 +84,7 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ./scripts/run_conformance.sh        # differential test against the system libz
 ```
 
-**All 88 symbols are exported; 36 are implemented.** The rest are generated stubs that report
+**All 88 symbols are exported; 68 are implemented.** The rest are generated stubs that report
 the gap on stderr and return the library's own error value, so a client gets a diagnostic
 rather than a link failure — and so each one becomes "move a name from `scripts/implemented.txt`
 and watch the conformance diff shrink". A name in both files is a duplicate-symbol link error,
@@ -96,6 +96,7 @@ so the two cannot drift.
 | One-shot | `compress`, `compress2`, `uncompress`, `uncompress2`, `compressBound` |
 | Streaming | `deflate`/`inflate` with `Init_`, `Init2_`, `End`, `Reset`, `ResetKeep`, plus `inflateReset2`, `deflateBound`, `deflatePending` |
 | gzip metadata | `deflateSetHeader`, `inflateGetHeader` |
+| Files | the whole `gz*` family — open, read, write, seek, tell, line and character access, buffering, errors |
 | Identity | `zlibVersion`, `zError`, `zlibCompileFlags` |
 
 The streaming API covers every framing the format offers: zlib (`windowBits` 8…15), raw
@@ -103,8 +104,14 @@ DEFLATE (−8…−15), gzip (+16), and the mode that accepts either zlib or gzi
 which (+32). The window is honoured rather than noted, since a decoder sizes its own from the
 header.
 
-Not yet: dictionaries, `inflateBack`, `deflateCopy`/`Params`/`Prime`/`Tune`, and the whole
-`gz*` file layer. Each of those reports itself rather than failing quietly.
+`gzFile` is worth a note, because it is the one part of the API that is not opaque: `zlib.h`
+defines its three fields and makes `gzgetc` a macro that takes a byte straight out of them
+without calling the library. So the handle really is a `struct gzFile_s`, the decompressed
+buffer lives at a stable address published through it, and every entry point reconciles what
+the macro consumed on the way in.
+
+Not yet: dictionaries, `inflateBack`, `deflateCopy`/`Params`/`Prime`/`Tune`, `inflateSync`,
+and a few introspection calls — 20 symbols, each reporting itself rather than failing quietly.
 
 Two build systems on purpose. SwiftPM drives development and the tests; CMake builds the
 shipped artifact, because the soname, the install name and the version script are not
@@ -116,7 +123,10 @@ expressible in `Package.swift`.
   version nodes — nothing missing, and none of the ~190 Swift symbols a naive link leaks.
 - Two conformance programs, each compiled twice — against the reference and against this
   library — are **identical on every compared line**. `zconform.c` covers the checksums, the
-  one-shot API and the error paths; `zstream.c` covers the streaming API across six input and
+  one-shot API and the error paths; `zgzfile.c` covers the file layer — round trips at four
+  levels, reads in chunks down to one byte, line and character access, seeking forwards and
+  backwards, transparent reading of a non-gzip file, concatenated members, and the error paths;
+  `zstream.c` covers the streaming API across six input and
   output chunk-size combinations (down to one byte at a time in both directions), ten
   compression levels, seven window sizes, all four framings, gzip headers written and read back
   through buffers too small for them, corrupt input, truncated members, and misuse such as
@@ -127,7 +137,8 @@ expressible in `Package.swift`.
   raw and gzip round trips with this library preloaded. **git** writes a commit through it, and
   `git fsck` then verifies those objects both with this library and with the stock one.
 - A `.gz` written through this library is accepted by **`gunzip(1)`** with the bytes and the
-  recorded filename intact, and a `.gz` written by `gzip(1)` reads back through it.
+  recorded filename intact, and a `.gz` written by `gzip(1)` reads back through it — including
+  two of them concatenated, and including a plain file read transparently.
 
 Three bugs were found by these harnesses that a round trip could not have found, all now
 regression-tested in `Tests/ZlibTests/StreamingTests.swift`: decompressing into a zero-length
