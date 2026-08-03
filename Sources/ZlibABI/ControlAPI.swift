@@ -184,15 +184,25 @@ public func inflateSync(_ strm: z_streamp!) -> Int32 {
     engine.alignToByte()
 
     let pattern: [UInt8] = [0x00, 0x00, 0xFF, 0xFF]
+
+    // How far back to fall on a mismatch: for each position, the length of the longest prefix
+    // of the marker that is also a suffix of what has matched so far.
+    //
+    // Not an optimisation — a correctness requirement, and this marker is exactly the shape
+    // that shows it. A block ending in a zero byte puts three zeros in front of the `FF FF`,
+    // and after matching two of them the third is a mismatch. Falling back to "have I just seen
+    // the first byte" answers one, when the truth is that the last two zeros are still a match
+    // in progress; answering one steps past the real marker and the scan runs off the end.
+    let fallback = [0, 1, 0, 0]
     var found = false
 
     while let byte = engine.readByte() {
-        // Matching a prefix that then breaks may itself start a new one, so a mismatch falls
-        // back to comparing against the first byte rather than starting from nothing.
+        while state.syncMatched > 0, byte != pattern[state.syncMatched] {
+            state.syncMatched = fallback[state.syncMatched - 1]
+        }
+
         if byte == pattern[state.syncMatched] {
             state.syncMatched += 1
-        } else {
-            state.syncMatched = byte == pattern[0] ? 1 : 0
         }
 
         if state.syncMatched == pattern.count {
@@ -214,6 +224,18 @@ public func inflateSync(_ strm: z_streamp!) -> Int32 {
 
     engine.resumeAtBlockBoundary()
     state.ended = false
+
+    // Whatever was skipped over is gone, so the trailer can no longer describe what was
+    // produced: a checksum over the recovered tail alone would never match, and failing the
+    // stream for that would throw away the very data this call exists to rescue. The reference
+    // stops checking here for the same reason.
+    state.validatesChecksum = false
+
+    switch state.engine {
+    case let .zlib(decompressor): decompressor.validatesChecksum = false
+    case let .gzip(decompressor): decompressor.validatesChecksum = false
+    case .raw, .undecided: break
+    }
 
     return Status.ok
 }
