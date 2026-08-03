@@ -7,9 +7,6 @@ match finding, the checksums — rather than a wrapper around the system zlib. T
 dependencies and no Foundation, so it builds wherever Swift does, including targets that
 have no zlib to link against.
 
-The engine was taken from [swift-png](https://github.com/PureSwift/swift-png), where it
-backs the PNG codec's compression path.
-
 ## Three modules
 
 They split where the specifications split.
