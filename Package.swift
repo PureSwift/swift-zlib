@@ -28,18 +28,34 @@ let package = Package(
         // that make substitution work are not expressible here.
         .library(name: "z", type: .dynamic, targets: ["ZlibABI"]),
     ],
+    traits: [
+        // Builds the three engine modules under Embedded Swift. Off by default because the
+        // feature is experimental and the hosted build must not depend on it; a caller opting
+        // in supplies -wmo on the command line, which Embedded requires and which is not this
+        // manifest's to force on dependents.
+        .trait(
+            name: "Embedded",
+            description: "Compile the engine modules under Embedded Swift."
+        )
+    ],
     targets: [
         // RFC 1951. Self-contained, and what everything else here is built on.
         .target(
             name: "LZ77",
-            path: "Sources/LZ77"
+            path: "Sources/LZ77",
+            swiftSettings: [
+                .enableExperimentalFeature("Embedded", .when(traits: ["Embedded"]))
+            ]
         ),
 
         // RFC 1950, over the above.
         .target(
             name: "Zlib",
             dependencies: ["LZ77"],
-            path: "Sources/Zlib"
+            path: "Sources/Zlib",
+            swiftSettings: [
+                .enableExperimentalFeature("Embedded", .when(traits: ["Embedded"]))
+            ]
         ),
 
         // RFC 1952, over the same. A sibling of Zlib rather than a mode inside it: the two
@@ -47,7 +63,10 @@ let package = Package(
         .target(
             name: "GZip",
             dependencies: ["LZ77"],
-            path: "Sources/GZip"
+            path: "Sources/GZip",
+            swiftSettings: [
+                .enableExperimentalFeature("Embedded", .when(traits: ["Embedded"]))
+            ]
         ),
 
         // The published C API as clients see it, plus the parts of the implementation that
