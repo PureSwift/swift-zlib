@@ -58,18 +58,20 @@ that stopped early would never learn it.
 
 ## What it produces
 
-Each block is written as stored (RFC 1951 §3.2.4) or fixed-Huffman (§3.2.6) over LZ77 matches
-found with a hash chain, whichever is smaller for that block — decided by costing the block's
-symbols rather than guessed. Dynamic blocks are the deliberate omission: they need a table
-built and sent, which is most of the code and nearly all of the memory a full encoder wants,
-and on the targets this exists to serve that trade is the right way round.
+Each block is written as stored (RFC 1951 §3.2.4), fixed-Huffman (§3.2.6) or dynamic-Huffman
+(§3.2.7) over LZ77 matches found with a hash chain — whichever of the three is smallest for
+that block, decided by costing all three rather than guessed. The decompressor reads all three
+as well, so it accepts anything zlib emits.
 
-The decompressor is complete: stored, fixed, and dynamic blocks are all read, so it accepts
-anything zlib emits.
+Sizes against zlib 1.3.1 at the same level: within a few per cent on most inputs, identical on
+incompressible input (both store it), and *smaller* on English text and on structured data like
+CSV. The worst case measured is about 18% larger, on a payload of one byte repeated with two
+rare exceptions — the length-limiting repair costs most where the ideal code lengths are most
+extreme.
 
-What the missing dynamic blocks cost, measured against zlib 1.3.1: compressible input comes
-out 1.4× to 6× larger. Incompressible input matches the reference byte for byte, because both
-fall back to storing it, and both stay inside `compressBound`.
+What is still missing is lazy matching: the encoder takes the longest match at each position
+rather than checking whether starting one byte later would pay better. That is most of the
+remaining difference.
 
 ## The C ABI
 
