@@ -80,7 +80,7 @@ public final class Inflate {
     private var heldLiteral: UInt8?
 
     /// Whether the stream has delivered its end marker.
-    public private(set) var isFinished = false
+    public internal(set) var isFinished = false
 
     public init() {}
 
@@ -125,6 +125,105 @@ public final class Inflate {
     /// lets a caller find the data following one embedded in a larger file.
     public var pulledInputCount: Int {
         self.reader.pulledByteCount
+    }
+
+    // -- what a caller can set or carry over ------------------------------------
+
+    /// Fills the window with bytes the stream is entitled to refer back to.
+    ///
+    /// A preset dictionary: text the encoder assumed was already here, so a distance may reach
+    /// into it before this stream has produced anything of its own. Only the last window's
+    /// worth is kept, the rest being unreachable by any distance.
+    public func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) {
+        let start = max(0, bytes.count - DeflateTables.windowSize)
+
+        for index in start ..< bytes.count {
+            self.window[self.windowPosition] = bytes[index]
+            self.windowPosition = (self.windowPosition + 1) % DeflateTables.windowSize
+        }
+
+        // Counted as produced so that distance checking allows reaching into it — which is the
+        // whole point of a dictionary — while staying bounded by the window.
+        self.totalProduced += bytes.count - start
+    }
+
+    /// The most recent window's worth of output, which is what a decoder resuming from here
+    /// would need and what `inflateGetDictionary` reports.
+    public var dictionary: [UInt8] {
+        let available = min(self.totalProduced, DeflateTables.windowSize)
+        guard available > 0 else { return [] }
+
+        var bytes = [UInt8](repeating: 0, count: available)
+        var position = (self.windowPosition + DeflateTables.windowSize - available)
+            % DeflateTables.windowSize
+
+        for index in 0 ..< available {
+            bytes[index] = self.window[position]
+            position = (position + 1) % DeflateTables.windowSize
+        }
+
+        return bytes
+    }
+
+    /// Puts bits in front of the stream, for a caller that consumed part of it itself.
+    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+        self.reader.prime(value, bits: count)
+    }
+
+    /// Whether the stream sits exactly at a stored block's length field with no bits consumed.
+    ///
+    /// Narrower than "between blocks", deliberately: this is the reference's definition, the
+    /// spot an empty stored block's header leaves a decoder at, and callers compare against
+    /// what the reference answers. At the very start of a stream, or after an ordinary block,
+    /// it answers no — there is a boundary there, but not a stored block's.
+    public var isAtSyncPoint: Bool {
+        self.state == .storedLength && self.reader.isByteAligned
+    }
+
+    /// Restarts block decoding from the current position, throwing away whatever partial state
+    /// the stream was in. For resynchronising after damage, where the alternative is to stop.
+    public func resumeAtBlockBoundary() {
+        self.state = .blockHeader
+        self.symbolPartial = HuffmanTable.Partial()
+        self.heldLiteral = nil
+        self.isFinalBlock = false
+        self.isFinished = false
+    }
+
+    /// Reads one byte, for a caller scanning the input itself.
+    public func readByte() -> UInt8? {
+        self.reader.bits(8).map { UInt8(truncatingIfNeeded: $0) }
+    }
+
+    /// An independent copy, sharing nothing.
+    public func copy() -> Inflate {
+        let clone = Inflate()
+
+        clone.state = self.state
+        clone.reader = self.reader
+        clone.window = self.window
+        clone.windowPosition = self.windowPosition
+        clone.totalProduced = self.totalProduced
+        clone.isFinalBlock = self.isFinalBlock
+        clone.literalCount = self.literalCount
+        clone.distanceCount = self.distanceCount
+        clone.codeLengthCodeCount = self.codeLengthCodeCount
+        clone.codeLengthLengths = self.codeLengthLengths
+        clone.codeLengthTable = self.codeLengthTable
+        clone.combinedLengths = self.combinedLengths
+        clone.combinedLengthsIndex = self.combinedLengthsIndex
+        clone.previousCodeLength = self.previousCodeLength
+        clone.literalTable = self.literalTable
+        clone.distanceTable = self.distanceTable
+        clone.symbolPartial = self.symbolPartial
+        clone.storedRemaining = self.storedRemaining
+        clone.pendingSymbol = self.pendingSymbol
+        clone.matchLength = self.matchLength
+        clone.matchDistance = self.matchDistance
+        clone.heldLiteral = self.heldLiteral
+        clone.isFinished = self.isFinished
+
+        return clone
     }
 
     // -- emitting produced bytes ------------------------------------------------
