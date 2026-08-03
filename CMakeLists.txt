@@ -1,10 +1,11 @@
 # Builds the installable artifact: a libz.so.1 a program compiled against the reference can
-# load unchanged.
+# load unchanged. Linux only, and on purpose: that is the platform the conformance suite runs
+# against, and a build path no check exercises is a claim, not a capability.
 #
 # SwiftPM builds the Swift libraries and drives the tests, and is the right tool for both. It
-# cannot build this, because the three things that make substitution work — the soname, the
-# install name, and the export list — have no expression in Package.swift. So there are two
-# build systems on purpose, over the same sources, and neither is generated from the other.
+# cannot build this, because the two things that make substitution work — the soname and the
+# version script — have no expression in Package.swift. So there are two build systems on
+# purpose, over the same sources, and neither is generated from the other.
 #
 # The Swift targets are built as one static library each, mirroring the SwiftPM target graph,
 # rather than compiling everything into a single blob. Keeping the module boundaries means the
@@ -107,48 +108,42 @@ set_target_properties(z PROPERTIES
     # So that editing the symbol list relinks. Without it the export control is applied once
     # and then silently kept stale, which is the one failure this whole arrangement exists to
     # prevent.
-    LINK_DEPENDS "${CMAKE_SOURCE_DIR}/build/zlib.map;${CMAKE_SOURCE_DIR}/build/zlib.exported"
+    LINK_DEPENDS "${CMAKE_SOURCE_DIR}/build/zlib.map"
     OUTPUT_NAME z
     VERSION ${SWIFTZLIB_VERSION}
     SOVERSION ${SWIFTZLIB_SONAME_VERSION}
 )
 
-if(APPLE)
-    target_link_options(z PRIVATE
-        "SHELL:-Xlinker -exported_symbols_list -Xlinker ${CMAKE_SOURCE_DIR}/build/zlib.exported"
-        # dyld refuses a library offering a lower compatibility version than the one a client
-        # recorded, so this matches the reference's rather than the project's own.
-        "SHELL:-Xlinker -compatibility_version -Xlinker ${SWIFTZLIB_SONAME_VERSION}"
-    )
-    target_link_libraries(z PRIVATE ZlibABI)
-else()
-    target_link_options(z PRIVATE
-        "SHELL:-Xlinker --version-script=${CMAKE_SOURCE_DIR}/build/zlib.map"
-    )
-    # Nothing inside the library calls the exported functions — they exist only to be called
-    # from outside — so ordinary archive resolution drops every one of them and produces a
-    # shared object that exports nothing at all.
-    #
-    # Every archive is kept whole, not only the two holding exported functions. The engine's
-    # objects are reached only from the boundary, and leaving them to the linker's usual
-    # what-have-I-seen-so-far rule is how this ends up with unresolved Swift symbols that fail
-    # nowhere until something tries to link against it. Keeping everything costs a little size
-    # and nothing else, because the version script decides what is published and
-    # check_exports.sh proves what was published.
-    #
-    # Named by path in link options rather than through target_link_libraries, because the
-    # archives have to sit *between* the two linker flags and a library list cannot express it.
-    target_link_options(z PRIVATE
-        "SHELL:-Xlinker --whole-archive \
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The installable libz.so.1 is built and verified for Linux only.")
+endif()
+
+target_link_options(z PRIVATE
+    "SHELL:-Xlinker --version-script=${CMAKE_SOURCE_DIR}/build/zlib.map"
+)
+# Nothing inside the library calls the exported functions — they exist only to be called
+# from outside — so ordinary archive resolution drops every one of them and produces a
+# shared object that exports nothing at all.
+#
+# Every archive is kept whole, not only the two holding exported functions. The engine's
+# objects are reached only from the boundary, and leaving them to the linker's usual
+# what-have-I-seen-so-far rule is how this ends up with unresolved Swift symbols that fail
+# nowhere until something tries to link against it. Keeping everything costs a little size
+# and nothing else, because the version script decides what is published and
+# check_exports.sh proves what was published.
+#
+# Named by path in link options rather than through target_link_libraries, because the
+# archives have to sit *between* the two linker flags and a library list cannot express it.
+target_link_options(z PRIVATE
+    "SHELL:-Xlinker --whole-archive \
 -Xlinker $<TARGET_FILE:ZlibABI> \
 -Xlinker $<TARGET_FILE:CZlib> \
 -Xlinker $<TARGET_FILE:SwiftZlib> \
 -Xlinker $<TARGET_FILE:GZip> \
 -Xlinker $<TARGET_FILE:LZ77> \
 -Xlinker --no-whole-archive"
-    )
-    add_dependencies(z ZlibABI CZlib SwiftZlib GZip LZ77)
-endif()
+)
+add_dependencies(z ZlibABI CZlib SwiftZlib GZip LZ77)
 
 install(TARGETS z LIBRARY DESTINATION lib)
 install(FILES

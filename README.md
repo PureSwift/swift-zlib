@@ -96,15 +96,11 @@ dozen bytes.
 
 The engine builds and runs under Embedded Swift — no Foundation, no existentials in its error
 paths, no zlib to link against — which is the configuration where a Swift implementation is
-load-bearing rather than an alternative. The package carries an `Embedded` trait:
-
-```
-swift build --traits Embedded -Xswiftc -wmo --target Zlib
-```
-
-`./scripts/check_embedded.sh` builds all three modules that way, compresses and decompresses
-40 KB through both wrappers and checks the result, then compiles the engine for
-`aarch64-none-none-elf`, `armv7-none-none-eabi` and `riscv32-none-none-eabi`.
+load-bearing rather than an alternative. `./scripts/check_embedded.sh` compresses and
+decompresses 40 KB through both wrappers under Embedded Swift and checks the result, then
+compiles the engine for `aarch64-none-none-elf`, `armv7-none-none-eabi` and
+`riscv32-none-none-eabi`. An embedded project supplies its own build flags, as such projects
+do; nothing in the manifest is involved.
 
 It is a script rather than a claim because this is easy to break from an ordinary desktop build
 without noticing: one existential in an error path is enough.
@@ -159,8 +155,9 @@ and their in-stream numbers are documented as this library's own. `inflateUnderm
 refused, as the reference refuses it unless built for it.
 
 Two build systems on purpose. SwiftPM drives development and the tests; CMake builds the
-shipped artifact, because the soname, the install name and the version script are not
-expressible in `Package.swift`.
+shipped artifact, because the soname and the version script are not expressible in
+`Package.swift`. **Linux only**: that is the platform every check here runs against, and a
+build path no check exercises would be a claim, not a capability.
 
 ### What is verified
 
