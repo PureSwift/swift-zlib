@@ -36,7 +36,12 @@ public final class Inflate {
 
     /// The last 32 KiB produced, which is as far back a match is ever asked to reach. Circular:
     /// `windowPosition` is where the next byte goes, wrapping at the end.
-    private var window = [UInt8](repeating: 0, count: DeflateTables.windowSize)
+    ///
+    /// Held as raw memory rather than an `Array` because every decoded byte is written here, and
+    /// a Swift array checks on each write whether its storage is uniquely referenced. That check
+    /// is worth paying where it buys safety; in a buffer this type allocates, owns, never shares
+    /// and never resizes, it buys nothing and costs a branch per byte.
+    private let window: UnsafeMutablePointer<UInt8>
     private var windowPosition = 0
     private var totalProduced = 0
 
@@ -82,7 +87,14 @@ public final class Inflate {
     /// Whether the stream has delivered its end marker.
     public internal(set) var isFinished = false
 
-    public init() {}
+    public init() {
+        self.window = .allocate(capacity: DeflateTables.windowSize)
+        self.window.initialize(repeating: 0, count: DeflateTables.windowSize)
+    }
+
+    deinit {
+        self.window.deallocate()
+    }
 
     public var needsInput: Bool {
         self.reader.needsInput
@@ -139,7 +151,7 @@ public final class Inflate {
 
         for index in start ..< bytes.count {
             self.window[self.windowPosition] = bytes[index]
-            self.windowPosition = (self.windowPosition + 1) % DeflateTables.windowSize
+            self.windowPosition = (self.windowPosition &+ 1) & DeflateTables.windowMask
         }
 
         // Counted as produced so that distance checking allows reaching into it — which is the
@@ -154,12 +166,12 @@ public final class Inflate {
         guard available > 0 else { return [] }
 
         var bytes = [UInt8](repeating: 0, count: available)
-        var position = (self.windowPosition + DeflateTables.windowSize - available)
-            % DeflateTables.windowSize
+        var position = (self.windowPosition &+ DeflateTables.windowSize &- available)
+            & DeflateTables.windowMask
 
         for index in 0 ..< available {
             bytes[index] = self.window[position]
-            position = (position + 1) % DeflateTables.windowSize
+            position = (position &+ 1) & DeflateTables.windowMask
         }
 
         return bytes
@@ -201,7 +213,10 @@ public final class Inflate {
 
         clone.state = self.state
         clone.reader = self.reader
-        clone.window = self.window
+
+        // Copied rather than shared: the whole point of a copy is that writing through one
+        // handle cannot be seen through the other.
+        clone.window.update(from: self.window, count: DeflateTables.windowSize)
         clone.windowPosition = self.windowPosition
         clone.totalProduced = self.totalProduced
         clone.isFinalBlock = self.isFinalBlock
@@ -258,8 +273,8 @@ public final class Inflate {
         self.destinationCount += 1
 
         self.window[self.windowPosition] = byte
-        self.windowPosition = (self.windowPosition + 1) % DeflateTables.windowSize
-        self.totalProduced += 1
+        self.windowPosition = (self.windowPosition &+ 1) & DeflateTables.windowMask
+        self.totalProduced &+= 1
     }
 
     /// Decompresses into `destination`, returning how many bytes were produced.
@@ -556,14 +571,39 @@ public final class Inflate {
             return true
 
         case .matchCopy:
-            while self.matchLength > 0, !self.destinationFull {
-                let sourceIndex =
-                    (self.windowPosition + DeflateTables.windowSize - self.matchDistance)
-                        % DeflateTables.windowSize
+            // The inner loop of the whole decoder: every byte of every match passes through it.
+            // Written against local copies and an unsafe view of the window so that each byte
+            // costs a load, a store and a mask, rather than that plus a bounds check and a
+            // reload of four properties through the class.
+            var position = self.windowPosition
+            var produced = self.destinationCount
+            var remaining = self.matchLength
 
-                self.emit(self.window[sourceIndex])
-                self.matchLength -= 1
+            let capacity = self.destinationCapacity
+            let distance = self.matchDistance
+            let destination = self.destination
+            let mask = DeflateTables.windowMask
+
+            let window = self.window
+
+            while remaining > 0, produced < capacity {
+                let byte = window[(position &+ DeflateTables.windowSize &- distance) & mask]
+
+                destination[produced] = byte
+                window[position] = byte
+
+                position = (position &+ 1) & mask
+                produced &+= 1
+                remaining &-= 1
             }
+
+            // However many the loop managed, which is what the match had left less what it has
+            // left now.
+            self.totalProduced &+= self.matchLength &- remaining
+
+            self.windowPosition = position
+            self.destinationCount = produced
+            self.matchLength = remaining
 
             guard self.matchLength == 0 else {
                 // Match unfinished, so the loop above ended on a full destination.
