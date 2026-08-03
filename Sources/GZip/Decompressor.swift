@@ -30,7 +30,7 @@ public final class Decompressor {
     }
 
     private var state: State = .fixedHeader
-    private let stream = Inflate()
+    private var stream = Inflate()
 
     private var checksumState = Crc32()
 
@@ -75,6 +75,43 @@ public final class Decompressor {
 
     public var pulledInputCount: Int {
         self.stream.pulledInputCount
+    }
+
+    /// The DEFLATE stream under the framing, for operations that work on it directly.
+    public var rawStream: Inflate {
+        self.stream
+    }
+
+    /// Whether the trailer's checksum and length are checked.
+    public var validatesChecksum = true
+
+    /// The window's worth of output a decoder would need to carry on from here.
+    public var dictionary: [UInt8] {
+        self.stream.dictionary
+    }
+
+    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+        self.stream.prime(value, bits: count)
+    }
+
+    /// An independent copy, sharing nothing.
+    public func copy() -> Decompressor {
+        let clone = Decompressor()
+
+        clone.state = self.state
+        clone.stream = self.stream.copy()
+        clone.checksumState = self.checksumState
+        clone.headerChecksumState = self.headerChecksumState
+        clone.field = self.field
+        clone.fieldLength = self.fieldLength
+        clone.flags = self.flags
+        clone.producedLength = self.producedLength
+        clone.header = self.header
+        clone.headerIsComplete = self.headerIsComplete
+        clone.isFinished = self.isFinished
+        clone.validatesChecksum = self.validatesChecksum
+
+        return clone
     }
 
     public func inflate(
@@ -158,7 +195,7 @@ public final class Decompressor {
 
                 // Least significant byte first, which is the order `readBits` already assembles
                 // — the opposite of zlib's trailer, which had to be reversed.
-                guard raw == self.checksumState.checksum else {
+                guard !self.validatesChecksum || raw == self.checksumState.checksum else {
                     throw DeflateError("gzip CRC-32 mismatch")
                 }
 
@@ -170,7 +207,7 @@ public final class Decompressor {
                 // §2.3.1: the original length modulo 2³². A member whose checksum matches but
                 // whose length does not is one that decoded to the right bytes and the wrong
                 // number of them, which no checksum alone would catch.
-                guard raw == self.producedLength else {
+                guard !self.validatesChecksum || raw == self.producedLength else {
                     throw DeflateError("gzip length mismatch")
                 }
 
