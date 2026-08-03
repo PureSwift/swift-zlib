@@ -15,7 +15,7 @@ import LZ77
 public final class Compressor {
     public typealias Ending = Deflate.Ending
 
-    private let stream: Deflate
+    private var stream: Deflate
     private var checksumState = Crc32()
 
     /// The original input length, which the trailer carries modulo 2³² so that a decompressor
@@ -28,7 +28,8 @@ public final class Compressor {
     private var wroteHeader = false
     private var wroteTrailer = false
 
-    private let level: Int32
+    private var level: Int32
+    private let windowBits: Int32
 
     /// The metadata to write, which a caller may replace up to the point the header goes out.
     ///
@@ -49,7 +50,42 @@ public final class Compressor {
     ///   header, gzip's does not record it, so this only limits the encoder.
     public init(level: Int32 = 6, windowBits: Int32 = 15) {
         self.level = level
-        self.stream = Deflate(level: level, windowBits: max(9, min(15, windowBits)))
+        self.windowBits = max(9, min(15, windowBits))
+        self.stream = Deflate(level: level, windowBits: self.windowBits)
+    }
+
+    public func setLevel(_ level: Int32) {
+        self.level = level
+        self.stream.setLevel(level)
+    }
+
+    public func tune(_ goodMatch: Int, _ maxLazy: Int, _ maxChainLength: Int) {
+        self.stream.tune(goodMatch: goodMatch, maxLazy: maxLazy, maxChainLength: maxChainLength)
+    }
+
+    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+        self.stream.prime(value, bits: count)
+    }
+
+    /// The window's worth of context a decoder would need to carry on from here.
+    public var dictionary: [UInt8] {
+        self.stream.dictionary
+    }
+
+    /// An independent copy, sharing nothing.
+    public func copy() -> Compressor {
+        let clone = Compressor(level: self.level, windowBits: self.windowBits)
+
+        clone.stream = self.stream.copy()
+        clone.checksumState = self.checksumState
+        clone.inputLength = self.inputLength
+        clone.pending = self.pending
+        clone.pendingOffset = self.pendingOffset
+        clone.wroteHeader = self.wroteHeader
+        clone.wroteTrailer = self.wroteTrailer
+        clone.header = self.header
+
+        return clone
     }
 
     public var needsInput: Bool {
