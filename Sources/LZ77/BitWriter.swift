@@ -74,4 +74,10 @@ struct BitWriter {
     var pendingByteCount: Int {
         self.output.count
     }
+
+    /// Whether anything at all has been written, which is what tells a caller wanting to insert
+    /// bits ahead of the stream whether it is still early enough to do so.
+    var isEmpty: Bool {
+        self.output.isEmpty && self.bitCount == 0
+    }
 }
