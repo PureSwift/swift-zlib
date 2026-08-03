@@ -21,7 +21,12 @@
 // Matching is the standard hash-chain arrangement: a rolling three-byte hash indexes the most
 // recent position with that hash, each of which links to the previous one, so the search walks
 // candidates newest-first and stops when it has looked far enough back to be worth it.
-public final class Deflate {
+// Split the same way as the decoder and for the same measured reason: a mutating access to a
+// struct stored in a class is dynamically checked for exclusivity, and the encoder makes one
+// per symbol through `self.writer`. In a noncopyable struct the same mutation through
+// `inout self` is checked at compile time instead. The class below is a box paying one dynamic
+// access per public call.
+struct DeflateCore: ~Copyable {
     /// How hard to look for matches, mapped from the level a caller asks for.
     private struct Effort {
         let maxChainLength: Int
@@ -132,7 +137,7 @@ public final class Deflate {
 
     /// Whether the stream has ended *and* every byte of it has been taken. The analogue of
     /// zlib's `Z_STREAM_END`, which likewise never arrives while output is still waiting.
-    public var isFinished: Bool {
+    var isFinished: Bool {
         self.streamEnded && self.writer.pendingByteCount == 0
     }
 
@@ -145,7 +150,7 @@ public final class Deflate {
     private var windowSize: Int
 
     /// - Parameter windowBits: the base-two logarithm of the window, 9 through 15.
-    public init(level: Int32, windowBits: Int32 = 15) {
+    init(level: Int32, windowBits: Int32 = 15) {
         self.effort = Effort.forLevel(level)
         self.head = [Int](repeating: -1, count: Self.hashSize)
         self.chain = []
@@ -159,12 +164,12 @@ public final class Deflate {
     /// Safe mid-stream because a level is not recorded anywhere in the format: it changes what
     /// this encoder chooses, never how a decoder reads the result. Blocks compressed at
     /// different levels sit side by side in one stream quite happily.
-    public func setLevel(_ level: Int32) {
+    mutating func setLevel(_ level: Int32) {
         self.effort = Effort.forLevel(level)
     }
 
     /// Sets the match search's knobs directly, which is what `deflateTune` exists for.
-    public func tune(goodMatch: Int, maxLazy: Int, maxChainLength: Int) {
+    mutating func tune(goodMatch: Int, maxLazy: Int, maxChainLength: Int) {
         self.effort = Effort(
             maxChainLength: max(0, maxChainLength),
             goodMatch: max(0, goodMatch),
@@ -180,7 +185,7 @@ public final class Deflate {
     ///
     /// Only the last window's worth can be reached by a distance, so anything before that is
     /// dropped rather than kept and never used.
-    public func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) {
+    mutating func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) {
         guard !bytes.isEmpty, self.pending.isEmpty else { return }
 
         let start = max(0, bytes.count - self.windowSize)
@@ -203,7 +208,7 @@ public final class Deflate {
 
     /// The most recent window's worth of bytes seen, which is what a decoder would need to
     /// continue from here and what `deflateGetDictionary` reports.
-    public var dictionary: [UInt8] {
+    var dictionary: [UInt8] {
         let end = self.emittedEnd
         let start = max(0, end - self.windowSize)
 
@@ -214,20 +219,20 @@ public final class Deflate {
     ///
     /// Only before anything has been written, because there is nowhere else they could go: the
     /// point is to let a caller prepend framing of its own to a stream this produces.
-    public func prime(_ value: UInt32, bits count: Int) -> Bool {
+    mutating func prime(_ value: UInt32, bits count: Int) -> Bool {
         guard self.writer.isEmpty, count >= 0, count <= 32 else { return false }
 
         self.writer.write(value, bits: count)
         return true
     }
 
-    /// An independent copy, sharing nothing.
+    /// An explicit duplicate, sharing nothing.
     ///
     /// Every field is a value type, so this is a memberwise copy and not a traversal: the point
     /// of saying so is that adding a reference-typed field later would silently make the two
     /// copies share it.
-    public func copy() -> Deflate {
-        let clone = Deflate(level: 6, windowBits: 15)
+    borrowing func copied() -> DeflateCore {
+        var clone = DeflateCore(level: 6, windowBits: 15)
 
         clone.effort = self.effort
         clone.windowSize = self.windowSize
@@ -251,7 +256,7 @@ public final class Deflate {
     ///
     /// Always true, because ``setInput(_:)`` copies: there is never a buffer part-way through
     /// being taken.
-    public var needsInput: Bool {
+    var needsInput: Bool {
         true
     }
 
@@ -262,29 +267,21 @@ public final class Deflate {
     /// output also happened to skip taking the input — and a caller that hands over a second
     /// buffer believing the first was taken loses it. Owning the bytes on receipt makes the
     /// question unaskable.
-    public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
+    mutating func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         guard !bytes.isEmpty else { return }
 
         self.pending.append(contentsOf: bytes)
         self.chain.append(contentsOf: [Int](repeating: -1, count: bytes.count))
     }
 
-    public enum Ending {
-        case none
-        case flush
-        /// A flush that also empties the window, so nothing after it refers to anything before
-        /// it. That independence is the point: a reader that lost its place — or never had it,
-        /// having joined mid-stream — can start at the marker and decode everything after.
-        case fullFlush
-        case finish
-    }
+    typealias Ending = Deflate.Ending
 
     /// Compresses into `destination`, returning how many bytes were produced.
     ///
     /// A result smaller than `count` with no ending asked for means the compressor is holding
     /// what it has been given, which is what a compressor does until it has enough context to
     /// find repetitions worth naming.
-    public func deflate(
+    mutating func deflate(
         into destination: UnsafeMutablePointer<UInt8>,
         count: Int,
         ending: Ending = .none
@@ -327,7 +324,7 @@ public final class Deflate {
         return self.drain(into: destination, count: count)
     }
 
-    private func drain(into destination: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
+    private mutating func drain(into destination: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
         let available = min(count, self.writer.pendingByteCount)
 
         guard available > 0 else { return 0 }
@@ -358,7 +355,7 @@ public final class Deflate {
         return ((a &<< 10) ^ (b &<< 5) ^ c) &* 0x9E37 & (Self.hashSize - 1)
     }
 
-    private func insert(at position: Int) {
+    private mutating func insert(at position: Int) {
         guard position + Self.minMatch <= self.pending.count else { return }
 
         let key = self.hash(at: position)
@@ -407,7 +404,7 @@ public final class Deflate {
         return (best, bestDistance)
     }
 
-    private func compressAvailable(keepingBack keepBack: Int) {
+    private mutating func compressAvailable(keepingBack keepBack: Int) {
         let limit = self.pending.count
 
         // Level zero asks for no match search at all, so there is nothing to be lazy about.
@@ -458,7 +455,7 @@ public final class Deflate {
     }
 
     /// Commits to a match, and puts the positions it covers into the hash chain.
-    private func take(_ match: (length: Int, distance: Int), startingAt start: Int) {
+    private mutating func take(_ match: (length: Int, distance: Int), startingAt start: Int) {
         self.appendMatch(length: match.length, distance: match.distance)
 
         // `start` and `cursor` are already in the chain — every position passes through the top
@@ -477,7 +474,7 @@ public final class Deflate {
 
     /// Commits to whatever is being held, so that a block can close on a whole number of
     /// symbols. Nothing may be written out while a match is still undecided.
-    private func resolveDeferred() {
+    private mutating func resolveDeferred() {
         guard let held = self.deferred else { return }
         self.take(held, startingAt: self.cursor - 1)
     }
@@ -488,7 +485,7 @@ public final class Deflate {
     }
 
     /// Drops history no match can reach any more, so `pending` does not grow with the stream.
-    private func trimWindow() {
+    private mutating func trimWindow() {
         let keep = self.windowSize
         guard self.cursor > keep * 2 else { return }
 
@@ -513,12 +510,12 @@ public final class Deflate {
 
     // -- collecting a block's symbols --------------------------------------------
 
-    private func appendLiteral(_ byte: UInt8) {
+    private mutating func appendLiteral(_ byte: UInt8) {
         self.symbols.append(UInt32(byte))
         self.literalFrequencies[Int(byte)] += 1
     }
 
-    private func appendMatch(length: Int, distance: Int) {
+    private mutating func appendMatch(length: Int, distance: Int) {
         self.symbols.append(
             0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
         )
@@ -561,7 +558,7 @@ public final class Deflate {
     /// A block is always written, even with nothing in it: that is how a stream with no input
     /// at all still ends with a final block, and how `.flush` produces something a reader can
     /// act on rather than nothing at all.
-    private func flushBlock(final: Bool) {
+    private mutating func flushBlock(final: Bool) {
         let blockEnd = self.emittedEnd
         let storedLength = blockEnd - self.blockStart
 
@@ -623,7 +620,7 @@ public final class Deflate {
     ///
     /// At the point this is called everything pending has been consumed and every block
     /// flushed, so what is dropped is pure history.
-    private func resetWindow() {
+    private mutating func resetWindow() {
         self.pending.removeAll(keepingCapacity: true)
         self.chain.removeAll(keepingCapacity: true)
         self.cursor = 0
@@ -641,7 +638,7 @@ public final class Deflate {
     /// the alignment built into its own format, and its five bytes — `00 00 00 FF FF` — are
     /// what every other implementation emits for a sync flush, so a reader expecting one finds
     /// exactly that.
-    private func writeSyncMarker() {
+    private mutating func writeSyncMarker() {
         self.writer.write(0, bits: 1)
         self.writer.write(0, bits: 2)
         self.writer.alignToByte()
@@ -649,7 +646,7 @@ public final class Deflate {
         self.writer.write(0xFFFF, bits: 16)
     }
 
-    private func writeStoredBlock(final: Bool, length: Int) {
+    private mutating func writeStoredBlock(final: Bool, length: Int) {
         // §3.2.4: BTYPE 00, then the rest of the byte discarded, then LEN and its one's
         // complement, then the bytes themselves verbatim.
         self.writer.write(final ? 1 : 0, bits: 1)
@@ -666,7 +663,7 @@ public final class Deflate {
         }
     }
 
-    private func writeFixedBlock(final: Bool) {
+    private mutating func writeFixedBlock(final: Bool) {
         self.writer.write(final ? 1 : 0, bits: 1)
         self.writer.write(1, bits: 2)
 
@@ -685,7 +682,7 @@ public final class Deflate {
         self.writeLiteralOrLength(DeflateTables.endOfBlock)
     }
 
-    private func writeDynamicBlock(final: Bool, table: DynamicBlock) {
+    private mutating func writeDynamicBlock(final: Bool, table: DynamicBlock) {
         self.writer.write(final ? 1 : 0, bits: 1)
         self.writer.write(2, bits: 2)
 
@@ -744,7 +741,7 @@ public final class Deflate {
 
     /// §3.2.6's fixed literal/length code: four ranges, each a contiguous run of codes at one of
     /// three lengths.
-    private func writeLiteralOrLength(_ symbol: UInt16) {
+    private mutating func writeLiteralOrLength(_ symbol: UInt16) {
         switch symbol {
         case 0 ... 143:
             self.writer.writeCode(UInt32(symbol) + 0b0011_0000, bits: 8)
@@ -757,7 +754,7 @@ public final class Deflate {
         }
     }
 
-    private func writeMatch(length: Int, distance: Int) {
+    private mutating func writeMatch(length: Int, distance: Int) {
         let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
 
         self.writeLiteralOrLength(UInt16(257 + lengthSymbol))
@@ -783,5 +780,55 @@ public final class Deflate {
                 bits: distanceExtra
             )
         }
+    }
+}
+
+
+/// The public face: a reference type over ``DeflateCore``, for the same reasons and at the
+/// same cost as ``Inflate``'s box.
+public final class Deflate {
+    public enum Ending {
+        case none
+        case flush
+        /// A flush that also empties the window, so nothing after it refers to anything before
+        /// it. That independence is the point: a reader that lost its place — or never had it,
+        /// having joined mid-stream — can start at the marker and decode everything after.
+        case fullFlush
+        case finish
+    }
+
+    var core: DeflateCore
+
+    public init(level: Int32, windowBits: Int32 = 15) {
+        self.core = DeflateCore(level: level, windowBits: windowBits)
+    }
+
+    public var needsInput: Bool { self.core.needsInput }
+    public var isFinished: Bool { self.core.isFinished }
+    public var dictionary: [UInt8] { self.core.dictionary }
+
+    public func setLevel(_ level: Int32) { self.core.setLevel(level) }
+
+    public func tune(goodMatch: Int, maxLazy: Int, maxChainLength: Int) {
+        self.core.tune(goodMatch: goodMatch, maxLazy: maxLazy, maxChainLength: maxChainLength)
+    }
+
+    public func primeWindow(_ bytes: UnsafeBufferPointer<UInt8>) { self.core.primeWindow(bytes) }
+    public func prime(_ value: UInt32, bits count: Int) -> Bool { self.core.prime(value, bits: count) }
+    public func setInput(_ bytes: UnsafeBufferPointer<UInt8>) { self.core.setInput(bytes) }
+
+    public func deflate(
+        into destination: UnsafeMutablePointer<UInt8>,
+        count: Int,
+        ending: Ending = .none
+    ) throws(DeflateError) -> Int {
+        try self.core.deflate(into: destination, count: count, ending: ending)
+    }
+
+    /// An independent copy, sharing nothing.
+    public func copy() -> Deflate {
+        let clone = Deflate(level: 6, windowBits: 15)
+        clone.core = self.core.copied()
+        return clone
     }
 }
