@@ -84,6 +84,32 @@ struct BitReader {
         return UInt32(truncatingIfNeeded: value)
     }
 
+    /// Makes `count` bits available if the input can supply them, and says whether it could.
+    ///
+    /// For a decoder that wants to look at several bits at once rather than one at a time. The
+    /// look-ahead is bounded by ``refill(upTo:)`` stopping the moment it has enough, so this
+    /// reads at most seven bits further than asked — under a byte, which is what keeps the
+    /// count of consumed input honest.
+    mutating func ensure(_ count: Int) -> Bool {
+        if self.bitCount < count {
+            self.refill(upTo: count)
+        }
+
+        return self.bitCount >= count
+    }
+
+    /// The next `count` bits without consuming them. Only valid after ``ensure(_:)`` said so.
+    func peek(_ count: Int) -> UInt32 {
+        let mask: UInt64 = count == 0 ? 0 : (~UInt64(0) >> (64 - count))
+        return UInt32(truncatingIfNeeded: self.buffer & mask)
+    }
+
+    /// Consumes bits already looked at.
+    mutating func drop(_ count: Int) {
+        self.buffer >>= count
+        self.bitCount -= count
+    }
+
     /// Puts `count` bits in front of whatever is read next.
     ///
     /// For a caller that has already consumed part of a stream by itself and wants this reader
