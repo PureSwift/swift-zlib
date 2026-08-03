@@ -88,11 +88,10 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ./scripts/run_conformance.sh        # differential test against the system libz
 ```
 
-**All 88 symbols are exported; 68 are implemented.** The rest are generated stubs that report
-the gap on stderr and return the library's own error value, so a client gets a diagnostic
-rather than a link failure — and so each one becomes "move a name from `scripts/implemented.txt`
-and watch the conformance diff shrink". A name in both files is a duplicate-symbol link error,
-so the two cannot drift.
+**All 88 symbols are implemented.** 86 in Swift, and the two variadics — `gzprintf` and
+`gzvprintf` — in C, since Swift cannot define a C variadic. The stub generator that carried the
+surface while it was being built now emits nothing, and remains in the build so that adding a
+symbol to `scripts/symbols.txt` without implementing it fails loudly again.
 
 | | |
 |---|---|
@@ -101,7 +100,11 @@ so the two cannot drift.
 | Streaming | `deflate`/`inflate` with `Init_`, `Init2_`, `End`, `Reset`, `ResetKeep`, plus `inflateReset2`, `deflateBound`, `deflatePending` |
 | gzip metadata | `deflateSetHeader`, `inflateGetHeader` |
 | Files | the whole `gz*` family — open, read, write, seek, tell, line and character access, buffering, errors |
-| Identity | `zlibVersion`, `zError`, `zlibCompileFlags` |
+| Dictionaries | `deflateSetDictionary`/`GetDictionary`, `inflateSetDictionary`/`GetDictionary`, with `Z_NEED_DICT` and the id check |
+| Control | `deflateParams` (mid-stream level change), `deflateTune`, `deflatePrime`/`inflatePrime`, `deflateCopy`/`inflateCopy` |
+| Recovery | `inflateSync` and `inflateSyncPoint`, over `Z_FULL_FLUSH`'s window reset; `inflateValidate` |
+| Callback-driven | `inflateBack`, `inflateBackInit_`, `inflateBackEnd` |
+| Identity | `zlibVersion`, `zError`, `zlibCompileFlags`, `get_crc_table` |
 
 The streaming API covers every framing the format offers: zlib (`windowBits` 8…15), raw
 DEFLATE (−8…−15), gzip (+16), and the mode that accepts either zlib or gzip without being told
@@ -114,8 +117,11 @@ without calling the library. So the handle really is a `struct gzFile_s`, the de
 buffer lives at a stable address published through it, and every entry point reconciles what
 the macro consumed on the way in.
 
-Not yet: dictionaries, `inflateBack`, `deflateCopy`/`Params`/`Prime`/`Tune`, `inflateSync`,
-and a few introspection calls — 20 symbols, each reporting itself rather than failing quietly.
+Two entry points answer honestly rather than identically: `inflateMark` and `inflateCodesUsed`
+report on the reference's own table layout and bit accounting, which a decoder built
+differently cannot reproduce — they return well-formed values and the contractual error cases,
+and their in-stream numbers are documented as this library's own. `inflateUndermine` is
+refused, as the reference refuses it unless built for it.
 
 Two build systems on purpose. SwiftPM drives development and the tests; CMake builds the
 shipped artifact, because the soname, the install name and the version script are not
