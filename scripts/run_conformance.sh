@@ -35,7 +35,7 @@ echo
 : > "$WORK/reference.err"
 : > "$WORK/candidate.err"
 
-for program in zconform zstream zgzfile; do
+for program in zconform zstream zgzfile zdict; do
     cc -O1 -o "$WORK/reference" "$ROOT/Conformance/$program.c" -lz
 
     # Against this library, the vendored header is the one to compile against, and the library
