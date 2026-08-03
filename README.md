@@ -134,6 +134,11 @@ in full — including `inflateSync` recovery and preset dictionaries — with ou
 the reference's, and `test/minigzip.c` round-trips in all three directions (ours to ours, ours
 to the reference, the reference to ours).
 
+`test/infcover.c` cannot run whole against any other implementation: it includes zlib's private
+headers and reaches into `struct inflate_state`. Its **24 adversarial streams** — written to
+reach every error path in inflate — are extracted and run through the public API instead, and
+**every one gives the identical answer**.
+
 **Differential fuzzing of inflate**, which is where zlib's CVEs have been. 6000 streams —
 intact, bit-flipped, truncated, byte-smashed and pure noise, across zlib, raw, gzip and
 auto-detect framing — generated once by the reference so both libraries decode identical
