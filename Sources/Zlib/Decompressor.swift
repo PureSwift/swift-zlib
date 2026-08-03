@@ -49,7 +49,14 @@ public final class Decompressor {
         self.state == .needsDictionary
     }
 
-    public init() {}
+    /// The largest window the caller is prepared for, or nil to take whatever the header
+    /// declares. A stream declaring more than the caller allowed for is refused rather than
+    /// decoded into a window it was not sized for.
+    private let maximumWindowBits: Int32?
+
+    public init(maximumWindowBits: Int32? = 15) {
+        self.maximumWindowBits = maximumWindowBits
+    }
 
     /// Supplies the preset dictionary the header asked for.
     public func setDictionary(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
@@ -82,7 +89,7 @@ public final class Decompressor {
 
     /// An independent copy, sharing nothing.
     public func copy() -> Decompressor {
-        let clone = Decompressor()
+        let clone = Decompressor(maximumWindowBits: self.maximumWindowBits)
 
         clone.state = self.state
         clone.stream = self.stream.copy()
@@ -128,7 +135,7 @@ public final class Decompressor {
             switch self.state {
             case .header:
                 guard let raw = self.stream.readBits(16) else { break loop }
-                try Self.checkHeader(raw)
+                try self.checkHeader(raw)
 
                 // §2.2: bit 5 of the flags says a preset dictionary was used, and names it in
                 // the four bytes that follow.
@@ -221,9 +228,10 @@ public final class Decompressor {
         return produced
     }
 
-    /// §2.2: the two header bytes read as a big-endian number must divide by 31, and the low
-    /// nibble of the first must name deflate.
-    private static func checkHeader(_ raw: UInt32) throws(DeflateError) {
+    /// §2.2: the two header bytes read as a big-endian number must divide by 31, the low nibble
+    /// of the first must name deflate, and the high nibble must not declare a window this
+    /// decoder was not asked to provide.
+    private func checkHeader(_ raw: UInt32) throws(DeflateError) {
         let cmf = raw & 0xFF
         let flg = (raw >> 8) & 0xFF
 
@@ -235,5 +243,20 @@ public final class Decompressor {
             throw DeflateError("unsupported compression method")
         }
 
+        // The window as a power of two, less eight. Beyond fifteen is outside the format;
+        // beyond what the caller asked for is outside what it allocated, and decoding into a
+        // window smaller than the stream reaches back through yields silent rubbish rather
+        // than a failure.
+        let declared = Int32((cmf >> 4) & 0x0F) + 8
+
+        guard declared <= 15 else {
+            throw DeflateError("zlib window size out of range")
+        }
+
+        if let maximumWindowBits = self.maximumWindowBits {
+            guard declared <= maximumWindowBits else {
+                throw DeflateError("zlib window size larger than requested")
+            }
+        }
     }
 }
