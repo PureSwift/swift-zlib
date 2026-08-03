@@ -85,4 +85,8 @@ enum DeflateTables {
     /// How far back a match can point and how much of it this format ever asks a decoder to
     /// keep, both fixed by the 15-bit distance extra-bits table above topping out at 32768.
     static let windowSize = 32768
+
+    /// The window being a power of two, wrapping is a mask rather than a division — which
+    /// matters because it happens twice for every byte a match copies.
+    static let windowMask = windowSize - 1
 }
