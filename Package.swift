@@ -24,8 +24,8 @@ let package = Package(
         .library(name: "LZ77", targets: ["LZ77"]),
 
         // For iterating on the C surface locally. The artifact that gets installed is built by
-        // CMakeLists.txt instead, because the soname, the install name and the version script
-        // that make substitution work are not expressible here.
+        // CMakeLists.txt instead, because the soname and the version script that make
+        // substitution work are not expressible here.
         .library(name: "z", type: .dynamic, targets: ["ZlibABI"]),
     ],
     targets: [
