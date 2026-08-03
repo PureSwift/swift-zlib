@@ -143,6 +143,59 @@ struct DecompressorTests {
         #expect(!stream.isFinished)
     }
 
+    /// §2.2's window field is a promise about how far back the stream reaches, and a decoder
+    /// sized for less cannot keep it. Accepting one anyway decodes into a window too small and
+    /// yields rubbish rather than a failure, which is the worse of the two outcomes.
+    @Test("A stream declaring more window than was asked for is refused")
+    func windowLargerThanRequested() throws {
+        let payload = Array(String(repeating: "the quick brown fox. ", count: 40).utf8)
+
+        // Declares a 32 KiB window, as the default encoder does.
+        let compressed = try CompressorTests.compress(payload, windowBits: 15)
+        #expect((compressed[0] >> 4) + 8 == 15)
+
+        // A decoder prepared for 32 KiB reads it; one prepared for 512 bytes does not.
+        let generous = Decompressor(maximumWindowBits: 15)
+        let strict = Decompressor(maximumWindowBits: 9)
+
+        for (stream, shouldRead) in [(generous, true), (strict, false)] {
+            var input = compressed
+            var output = [UInt8](repeating: 0, count: payload.count + 64)
+
+            let decoded: Bool
+
+            do {
+                _ = try input.withUnsafeMutableBufferPointer { buffer -> Int in
+                    stream.setInput(UnsafeBufferPointer(buffer))
+
+                    return try output.withUnsafeMutableBufferPointer {
+                        try stream.inflate(into: $0.baseAddress!, count: $0.count)
+                    }
+                }
+                decoded = true
+            } catch {
+                decoded = false
+            }
+
+            #expect(decoded == shouldRead)
+        }
+    }
+
+    /// A window beyond fifteen is outside the format however much the caller allocated.
+    @Test("A window size outside the format is refused")
+    func windowOutOfRange() throws {
+        // CINFO of 8 declares a 64 KiB window; the check bits are fixed up so the header is
+        // otherwise well formed and only the window is wrong.
+        let cmf: UInt32 = 0x88
+        var flg: UInt32 = 0
+
+        while (cmf * 256 + flg) % 31 != 0 { flg += 1 }
+
+        #expect(throws: DeflateError.self) {
+            _ = try Self.inflate([UInt8(cmf), UInt8(flg), 0x03, 0x00])
+        }
+    }
+
     @Test("A bad zlib header is refused")
     func badHeader() throws {
         #expect(throws: DeflateError.self) {
