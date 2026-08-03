@@ -75,6 +75,17 @@ measured. The two worst cases are highly repetitive payloads — 362 bytes again
 of zeroes, and 219 against 207 for a repeating pattern — where the absolute difference is a few
 dozen bytes.
 
+## Embedded Swift
+
+The engine builds and runs under Embedded Swift — no Foundation, no existentials in its error
+paths, no zlib to link against — which is the configuration where a Swift implementation is
+load-bearing rather than an alternative. `./scripts/check_embedded.sh` compresses and
+decompresses 40 KB through both wrappers and checks the result, then compiles the engine for
+`aarch64-none-none-elf`, `armv7-none-none-eabi` and `riscv32-none-none-eabi`.
+
+It is a script rather than a claim because this is easy to break from an ordinary desktop build
+without noticing: one existential in an error path is enough.
+
 ## The C ABI
 
 `cmake --build` produces a `libz.so.1` that a program compiled against the reference can load
@@ -86,6 +97,7 @@ vendored `zlib.h`, so the exported ABI cannot drift from what clients were compi
 cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ./scripts/check_exports.sh          # exactly the reference's 88 symbols, right version nodes
 ./scripts/run_conformance.sh        # differential test against the system libz
+./scripts/check_embedded.sh         # Embedded Swift round trip, and bare-metal compilation
 ```
 
 **All 88 symbols are implemented.** 86 in Swift, and the two variadics — `gzprintf` and
