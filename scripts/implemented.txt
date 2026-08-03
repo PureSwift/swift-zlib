@@ -51,3 +51,35 @@ deflatePending
 # gzip metadata, in HeaderAPI.swift.
 deflateSetHeader
 inflateGetHeader
+
+# The file layer, in GzFileAPI.swift. gzprintf and gzvprintf are hand-written C.
+gzopen
+gzopen64
+gzdopen
+gzbuffer
+gzsetparams
+gzread
+gzfread
+gzwrite
+gzfwrite
+gzputs
+gzgets
+gzputc
+gzgetc
+gzgetc_
+gzungetc
+gzflush
+gzseek
+gzseek64
+gzrewind
+gztell
+gztell64
+gzoffset
+gzoffset64
+gzeof
+gzdirect
+gzclose
+gzclose_r
+gzclose_w
+gzerror
+gzclearerr
