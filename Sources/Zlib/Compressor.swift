@@ -127,7 +127,11 @@ public final class Compressor {
         guard count > 0 else { return 0 }
 
         if !self.wroteHeader {
-            self.pending = Self.header(windowBits: self.windowBits, dictionaryId: self.dictionaryId)
+            self.pending = Self.header(
+                windowBits: self.windowBits,
+                level: self.level,
+                dictionaryId: self.dictionaryId
+            )
             self.pendingOffset = 0
             self.wroteHeader = true
         }
@@ -186,9 +190,25 @@ public final class Compressor {
     /// The window recorded here is the one the encoder was actually held to, not a fixed 32 KiB:
     /// a decoder sizes its own window from this byte, and telling it more than the encoder used
     /// only wastes its memory while telling it less would be a lie it cannot survive.
-    private static func header(windowBits: Int32, dictionaryId: UInt32?) -> [UInt8] {
+    private static func header(
+        windowBits: Int32,
+        level: Int32,
+        dictionaryId: UInt32?
+    ) -> [UInt8] {
         let cmf = UInt32((windowBits - 8) << 4) | 8
-        var flg: UInt32 = dictionaryId == nil ? 0 : 0x20
+
+        // §2.2's FLEVEL: a hint about how hard the compressor worked, which no decoder acts on.
+        // Set to what the reference sets it to at the same level, so that a stream from here is
+        // byte-identical in its header to one from there rather than merely as valid.
+        let levelFlags: UInt32
+        switch level {
+        case ..<2: levelFlags = 0
+        case 2 ..< 6: levelFlags = 1
+        case 6: levelFlags = 2
+        default: levelFlags = 3
+        }
+
+        var flg = (levelFlags << 6) | (dictionaryId == nil ? 0 : 0x20)
 
         while (cmf * 256 + flg) % 31 != 0 {
             flg += 1
