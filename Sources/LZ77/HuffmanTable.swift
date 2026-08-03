@@ -35,7 +35,11 @@ struct HuffmanTable {
 
     /// Builds the table from one code length per symbol; a length of zero means the symbol is
     /// not in this alphabet at all.
-    init(lengths: [UInt8]) throws(DeflateError) {
+    ///
+    /// - Parameter allowingIncomplete: whether a set of lengths that does not fill the code
+    ///   space may be accepted. Only §3.2.7's one case may: a distance alphabet of a single
+    ///   one-bit code, which the format explicitly permits and which leaves one code unused.
+    init(lengths: [UInt8], allowingIncomplete: Bool = false) throws(DeflateError) {
         var blCount = [Int](repeating: 0, count: Self.maxBits + 1)
 
         for length in lengths where length > 0 {
@@ -63,6 +67,34 @@ struct HuffmanTable {
             nextCode[bits] = code
             firstSymbolIndexByLength[bits] = runningIndex
             runningIndex += blCount[bits]
+        }
+
+        // A set of lengths that leaves part of the code space unclaimed is a set with bit
+        // patterns that decode to nothing at all. Reading one is not merely wasteful — it means
+        // a stream can be built whose codes are ambiguous about where they end, and a decoder
+        // that only notices when such a pattern happens to turn up will accept corrupt input
+        // that never happens to contain one. The reference refuses these at table-build time
+        // and so does this.
+        //
+        // Counted the same way the space is spent: a code of `bits` claims 2^(maxBits - bits)
+        // of a budget of 2^maxBits, so the arithmetic is exact.
+        var claimed = 0
+
+        for bits in 1 ... Self.maxBits {
+            claimed += blCount[bits] << (Self.maxBits - bits)
+        }
+
+        let full = 1 << Self.maxBits
+        let onlySingleOneBitCode = blCount[1] == 1 && (2 ... Self.maxBits).allSatisfy {
+            blCount[$0] == 0
+        }
+
+        if claimed < full, !(allowingIncomplete && onlySingleOneBitCode) {
+            // An alphabet with nothing in it at all is not incomplete, it is absent, and a
+            // block may legitimately declare one — a distance table for a block with no matches.
+            guard claimed == 0 else {
+                throw DeflateError("incomplete Huffman table")
+            }
         }
 
         var symbolsByPosition = [UInt16](repeating: 0, count: runningIndex)
