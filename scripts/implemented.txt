@@ -83,3 +83,29 @@ gzclose_r
 gzclose_w
 gzerror
 gzclearerr
+
+# Dictionaries, in DictionaryAPI.swift.
+deflateSetDictionary
+deflateGetDictionary
+inflateSetDictionary
+inflateGetDictionary
+
+# Knobs, clones, resynchronisation and introspection, in ControlAPI.swift.
+deflateParams
+deflateTune
+deflatePrime
+inflatePrime
+deflateCopy
+inflateCopy
+inflateSync
+inflateSyncPoint
+inflateValidate
+inflateUndermine
+inflateMark
+inflateCodesUsed
+get_crc_table
+
+# Callback-driven decompression, in InflateBackAPI.swift.
+inflateBackInit_
+inflateBack
+inflateBackEnd
