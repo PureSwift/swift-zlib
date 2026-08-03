@@ -20,10 +20,17 @@ enum HuffmanBuilder {
 
         guard !used.isEmpty else { return lengths }
 
-        // §3.2.7 allows an alphabet of one, and requires it to be written with one bit rather
-        // than none — a code of zero bits would be indistinguishable from the absence of one.
+        // An alphabet of one gets two codes, not one.
+        //
+        // One would be legal for the distance alphabet, which §3.2.7 explicitly allows to hold
+        // a single one-bit code. It is not legal for the code-length alphabet, and a decoder
+        // that refuses incomplete tables — as this module's does, and as the reference does —
+        // rejects a stream carrying one. Handing out a second code costs a bit that never
+        // appears in the output and makes every alphabet complete, which is what the reference
+        // does and for the same reason: to be rid of the special case rather than track it.
         guard used.count > 1 else {
             lengths[used[0]] = 1
+            lengths[used[0] == 0 ? 1 : 0] = 1
             return lengths
         }
 
