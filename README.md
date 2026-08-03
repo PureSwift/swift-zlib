@@ -63,15 +63,17 @@ Each block is written as stored (RFC 1951 §3.2.4), fixed-Huffman (§3.2.6) or d
 that block, decided by costing all three rather than guessed. The decompressor reads all three
 as well, so it accepts anything zlib emits.
 
-Sizes against zlib 1.3.1 at the same level: within a few per cent on most inputs, identical on
-incompressible input (both store it), and *smaller* on English text and on structured data like
-CSV. The worst case measured is about 18% larger, on a payload of one byte repeated with two
-rare exceptions — the length-limiting repair costs most where the ideal code lengths are most
-extreme.
+Matches are found greedily at the fast levels and lazily from level 4 up — taking a match only
+after checking whether a longer one starts on the next byte — which is the same split the
+reference makes, and for the same reason: deferring doubles the number of searches and on some
+data costs a little size as well.
 
-What is still missing is lazy matching: the encoder takes the longest match at each position
-rather than checking whether starting one byte later would pay better. That is most of the
-remaining difference.
+Sizes against zlib 1.3.1 at the same level: within 0.3% on most inputs at levels 6 and 9,
+identical on incompressible input (both store it), and *smaller* on English text, source code
+and run-structured data. At level 1 the output is smaller than the reference's on every input
+measured. The two worst cases are highly repetitive payloads — 362 bytes against 313 for 300 KB
+of zeroes, and 219 against 207 for a repeating pattern — where the absolute difference is a few
+dozen bytes.
 
 ## The C ABI
 
