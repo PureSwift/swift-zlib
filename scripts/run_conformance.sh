@@ -35,7 +35,7 @@ echo
 : > "$WORK/reference.err"
 : > "$WORK/candidate.err"
 
-for program in zconform zstream; do
+for program in zconform zstream zgzfile; do
     cc -O1 -o "$WORK/reference" "$ROOT/Conformance/$program.c" -lz
 
     # Against this library, the vendored header is the one to compile against, and the library
@@ -45,8 +45,14 @@ for program in zconform zstream; do
 
     echo "== $program ==" | tee -a "$WORK/reference.out" >> "$WORK/candidate.out"
 
-    "$WORK/reference" >> "$WORK/reference.out" 2>> "$WORK/reference.err" || true
-    "$WORK/candidate" >> "$WORK/candidate.out" 2>> "$WORK/candidate.err" || true
+    # Each build gets its own directory to write into, so one cannot read a file the other
+    # left behind and call it a pass.
+    mkdir -p "$WORK/files-reference" "$WORK/files-candidate"
+
+    "$WORK/reference" "$WORK/files-reference" \
+        >> "$WORK/reference.out" 2>> "$WORK/reference.err" || true
+    "$WORK/candidate" "$WORK/files-candidate" \
+        >> "$WORK/candidate.out" 2>> "$WORK/candidate.err" || true
 done
 
 if [[ -s "$WORK/candidate.err" ]]; then
