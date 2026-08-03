@@ -394,7 +394,7 @@ final class GzFile {
                 continue
             }
 
-            if ending == .flush {
+            if ending == .flush || ending == .fullFlush {
                 ending = .none
                 continue
             }
