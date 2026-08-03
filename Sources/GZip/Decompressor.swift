@@ -58,6 +58,9 @@ public final class Decompressor {
 
     public private(set) var isFinished = false
 
+    /// How many bytes the last call wrote, whether it returned or threw.
+    public private(set) var producedInLastCall = 0
+
     public init() {}
 
     public var needsInput: Bool {
@@ -120,6 +123,10 @@ public final class Decompressor {
     ) throws(DeflateError) -> Int {
         var produced = 0
 
+        // Recorded on the way out however this returns, so a stream that fails partway can
+        // still say how much of the caller's buffer it filled before it did.
+        defer { self.producedInLastCall = produced }
+
         loop: while true {
             switch self.state {
             case .fixedHeader:
@@ -165,10 +172,20 @@ public final class Decompressor {
                 self.state = .data
 
             case .data:
-                let made = try self.stream.inflate(
-                    into: destination + produced,
-                    count: count - produced
-                )
+                let made: Int
+
+                do {
+                    made = try self.stream.inflate(
+                        into: destination + produced,
+                        count: count - produced
+                    )
+                } catch {
+                    // The stream below wrote whatever it decoded before it failed, straight
+                    // into the caller's buffer. Counting it on the way past is the only chance
+                    // to: the error carries a message, not a length.
+                    produced += self.stream.producedInLastCall
+                    throw error
+                }
 
                 if made > 0 {
                     self.checksumState.update(
