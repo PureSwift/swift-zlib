@@ -6,7 +6,10 @@ import Testing
 /// borrowed per call, never stored, and what was not consumed is offered again. What is under
 /// test is that contract — a round trip that re-offers unconsumed input the way a real caller
 /// must, driven through buffers small enough that every resumption path runs.
+// The engine's span entry points back-deploy with Span itself; `Array.span`, which these
+// tests lean on for convenience, does not. The availability is the accessor's, not the API's.
 @Suite("Span API")
+@available(macOS 26.0, *)
 struct SpanAPITests {
     static let payload = Array(
         (String(repeating: "the quick brown fox jumps over the lazy dog. ", count: 200)).utf8
