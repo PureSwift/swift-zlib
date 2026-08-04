@@ -37,6 +37,27 @@ public struct Crc32 {
         return table
     }()
 
+    /// Eight tables in one flat array, `slicing[t * 256 + i]`: table `t` advances a byte
+    /// through `t + 1` further bytes of zeros, which is what lets eight input bytes fold into
+    /// the state with eight independent lookups instead of eight dependent ones. Table zero is
+    /// exactly ``table``; the published one keeps its own identity because `get_crc_table`
+    /// hands it out and its shape is API.
+    private static let slicing: [UInt32] = {
+        var slicing = [UInt32](repeating: 0, count: 8 * 256)
+
+        for index in 0 ..< 256 {
+            slicing[index] = Self.table[index]
+        }
+        for t in 1 ..< 8 {
+            for index in 0 ..< 256 {
+                let previous = slicing[(t - 1) * 256 + index]
+                slicing[t * 256 + index] = (previous >> 8) ^ Self.table[Int(previous & 0xFF)]
+            }
+        }
+
+        return slicing
+    }()
+
     private var state: UInt32 = 0xFFFF_FFFF
 
     public init() {}
@@ -53,8 +74,39 @@ public struct Crc32 {
     public mutating func update(_ bytes: UnsafeBufferPointer<UInt8>) {
         var state = self.state
 
-        for byte in bytes {
-            state = Crc32.table[Int((state ^ UInt32(byte)) & 0xFF)] ^ (state >> 8)
+        guard var cursor = bytes.baseAddress else { return }
+        var remaining = bytes.count
+
+        // Eight bytes per iteration: four folded through the state, four through zeros, all
+        // eight resolved by independent table reads the processor can overlap. The tail that
+        // does not fill a group goes the byte-at-a-time way below.
+        if remaining >= 8 {
+            Self.slicing.withUnsafeBufferPointer { slicing in
+                while remaining >= 8 {
+                    let low = state ^ UInt32(
+                        littleEndian: UnsafeRawPointer(cursor).loadUnaligned(as: UInt32.self)
+                    )
+                    let high = UInt32(
+                        littleEndian: UnsafeRawPointer(cursor + 4).loadUnaligned(as: UInt32.self)
+                    )
+
+                    state = slicing[Int(7 * 256 + (low & 0xFF))]
+                        ^ slicing[Int(6 * 256 + ((low >> 8) & 0xFF))]
+                        ^ slicing[Int(5 * 256 + ((low >> 16) & 0xFF))]
+                        ^ slicing[Int(4 * 256 + (low >> 24))]
+                        ^ slicing[Int(3 * 256 + (high & 0xFF))]
+                        ^ slicing[Int(2 * 256 + ((high >> 8) & 0xFF))]
+                        ^ slicing[Int(1 * 256 + ((high >> 16) & 0xFF))]
+                        ^ slicing[Int(high >> 24)]
+
+                    cursor += 8
+                    remaining -= 8
+                }
+            }
+        }
+
+        for index in 0 ..< remaining {
+            state = Crc32.table[Int((state ^ UInt32(cursor[index])) & 0xFF)] ^ (state >> 8)
         }
 
         self.state = state

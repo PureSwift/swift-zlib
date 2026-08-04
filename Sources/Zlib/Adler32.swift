@@ -27,24 +27,57 @@ public struct Adler32 {
     }
 
     public mutating func update(_ bytes: UnsafeBufferPointer<UInt8>) {
-        // Reduced every so often rather than after every byte, which is what keeps this a
-        // handful of adds per byte instead of a division: `second` cannot overflow a 32-bit
-        // accumulator before enough bytes have passed for the reduction to be worth doing
-        // again, so it is deferred until the block below is about to run out of headroom.
-        var index = 0
+        // Two deferrals at once. The modulo is deferred the classic way: neither sum can
+        // overflow 32 bits within 5552 bytes (zlib's NMAX), so the reduction runs once per
+        // block rather than once per byte. And within each sixteen-byte group the serial
+        // dependence of `second` on every intermediate `first` is unrolled algebraically —
+        //
+        //     second += 16*first + 16*b0 + 15*b1 + ... + 1*b15
+        //     first  += b0 + ... + b15
+        //
+        // — which turns a chain of dependent adds into two independent reductions the
+        // compiler is free to vectorize. Same arithmetic, in a shape hardware can run wide.
+        guard var cursor = bytes.baseAddress else { return }
+        var remaining = bytes.count
 
-        while index < bytes.count {
-            let chunk = min(bytes.count - index, 5552)
+        var first = self.first
+        var second = self.second
 
-            for offset in 0 ..< chunk {
-                self.first += UInt32(bytes[index + offset])
-                self.second += self.first
+        while remaining >= 16 {
+            var groups = min(remaining / 16, 347) // 347 * 16 = 5552, the reduction budget
+
+            remaining -= groups * 16
+
+            while groups > 0 {
+                second &+= first &* 16
+
+                var plain: UInt32 = 0
+                var weighted: UInt32 = 0
+
+                for offset in 0 ..< 16 {
+                    let byte = UInt32(cursor[offset])
+                    plain &+= byte
+                    weighted &+= byte &* UInt32(16 - offset)
+                }
+
+                first &+= plain
+                second &+= weighted
+
+                cursor += 16
+                groups -= 1
             }
 
-            self.first %= Self.modulus
-            self.second %= Self.modulus
-            index += chunk
+            first %= Self.modulus
+            second %= Self.modulus
         }
+
+        for offset in 0 ..< remaining {
+            first &+= UInt32(cursor[offset])
+            second &+= first
+        }
+
+        self.first = first % Self.modulus
+        self.second = second % Self.modulus
     }
 
     public mutating func update(_ byte: UInt8) {

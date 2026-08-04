@@ -33,23 +33,39 @@ struct DeflateCore: ~Copyable {
         let goodMatch: Int
         let maxLazy: Int
 
+        /// The reference's `good_length` column: while a match at least this long is already
+        /// in hand, the search for a better one runs on a quarter of the chain budget —
+        /// beating a good match is unlikely, so little is spent trying. Zero means never.
+        let quarterAt: Int
+
+        /// The reference's insertion cap for its greedy levels: a match longer than this has
+        /// its covered positions left out of the hash table entirely. At levels that take
+        /// every match as found, hashing the inside of a long run costs real time and buys
+        /// almost nothing — the run's own head is already indexed. The lazy levels index
+        /// everything, as the reference does.
+        let maxInsert: Int
+
         /// `maxLazy` of zero means take every match as it is found, without looking a byte
         /// further — which is what the reference does for its fast levels, and what the levels
         /// below four ask for by asking to be fast. Deferring doubles the number of searches,
         /// and on data whose matches cluster around the threshold it can cost a little size as
         /// well: it is a heuristic, not a strict improvement.
+        ///
+        /// The columns are the reference's own configuration_table, in its terms:
+        /// (max_chain, nice_length, max_lazy, good_length) — with `maxInsert` standing in for
+        /// what its greedy levels do with max_insert_length.
         static func forLevel(_ level: Int32) -> Effort {
             switch level {
-            case ..<1: return Effort(maxChainLength: 0, goodMatch: 0, maxLazy: 0)
-            case 1: return Effort(maxChainLength: 4, goodMatch: 8, maxLazy: 0)
-            case 2: return Effort(maxChainLength: 8, goodMatch: 16, maxLazy: 0)
-            case 3: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 0)
-            case 4: return Effort(maxChainLength: 16, goodMatch: 16, maxLazy: 4)
-            case 5: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 16)
-            case 6: return Effort(maxChainLength: 128, goodMatch: 128, maxLazy: 16)
-            case 7: return Effort(maxChainLength: 256, goodMatch: 128, maxLazy: 32)
-            case 8: return Effort(maxChainLength: 1024, goodMatch: 258, maxLazy: 128)
-            default: return Effort(maxChainLength: 4096, goodMatch: 258, maxLazy: 258)
+            case ..<1: return Effort(maxChainLength: 0, goodMatch: 0, maxLazy: 0, quarterAt: 0, maxInsert: 0)
+            case 1: return Effort(maxChainLength: 4, goodMatch: 8, maxLazy: 0, quarterAt: 0, maxInsert: 4)
+            case 2: return Effort(maxChainLength: 8, goodMatch: 16, maxLazy: 0, quarterAt: 0, maxInsert: 5)
+            case 3: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 0, quarterAt: 0, maxInsert: 6)
+            case 4: return Effort(maxChainLength: 16, goodMatch: 16, maxLazy: 4, quarterAt: 4, maxInsert: .max)
+            case 5: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 16, quarterAt: 8, maxInsert: .max)
+            case 6: return Effort(maxChainLength: 128, goodMatch: 128, maxLazy: 16, quarterAt: 8, maxInsert: .max)
+            case 7: return Effort(maxChainLength: 256, goodMatch: 128, maxLazy: 32, quarterAt: 8, maxInsert: .max)
+            case 8: return Effort(maxChainLength: 1024, goodMatch: 258, maxLazy: 128, quarterAt: 32, maxInsert: .max)
+            default: return Effort(maxChainLength: 4096, goodMatch: 258, maxLazy: 258, quarterAt: 32, maxInsert: .max)
             }
         }
     }
@@ -62,10 +78,24 @@ struct DeflateCore: ~Copyable {
     private var pending: [UInt8] = []
     private var cursor = 0
 
-    /// head[hash] is the most recent position with that hash; chain[position] is the previous
-    /// one. Positions are indices into `pending`, rebased whenever it is trimmed.
-    private var head: [Int]
-    private var chain: [Int]
+    /// head[hash] is the most recent position with that hash; chain[position & chainMask] is
+    /// the previous one. Positions are indices into `pending`, rebased whenever it is trimmed.
+    ///
+    /// Raw memory rather than arrays for the same reason as the decoder's window: these are
+    /// touched for every input byte, this struct allocates and owns them outright, and an
+    /// array's uniqueness and bounds checking buy nothing here but a branch per access.
+    ///
+    /// `chain` is a fixed ring the size of the largest window rather than an array running
+    /// the length of `pending`, and the difference is not memory but locality: a chain walk
+    /// hops all over this buffer, and 32K entries stay in cache where a buffer the length of
+    /// the input does not. The ring is sound because a slot is overwritten only by a position
+    /// exactly `chainSize` later — and by then the position it held is out of any window's
+    /// reach, which is the condition under which the walk already refuses to follow it.
+    private var head: UnsafeMutablePointer<Int>
+    private var chain: UnsafeMutablePointer<Int>
+
+    private static let chainSize = 1 << 15 // the largest windowSize
+    private static let chainMask = chainSize - 1
 
     private static let hashBits = 15
     private static let hashSize = 1 << hashBits
@@ -87,8 +117,11 @@ struct DeflateCore: ~Copyable {
     /// with its length in bits 0...8 and its distance in bits 9...24.
     ///
     /// Packed into a word rather than an enum because there is one of these per literal byte,
-    /// and the array is the encoder's largest allocation.
-    private var symbols: [UInt32] = []
+    /// and raw fixed-capacity memory rather than an array because one is appended per literal
+    /// byte too: the capacity is `maxBlockSymbols` by construction — `blockIsFull` closes the
+    /// block before another append — so the append is a store and an increment, nothing else.
+    private var symbols: UnsafeMutablePointer<UInt32>
+    private var symbolCount = 0
 
     /// Where in `pending` the open block's uncompressed bytes start, which is what a stored
     /// block writes out and therefore what cannot be trimmed away while the block is open.
@@ -152,9 +185,18 @@ struct DeflateCore: ~Copyable {
     /// - Parameter windowBits: the base-two logarithm of the window, 9 through 15.
     init(level: Int32, windowBits: Int32 = 15) {
         self.effort = Effort.forLevel(level)
-        self.head = [Int](repeating: -1, count: Self.hashSize)
-        self.chain = []
+        self.head = .allocate(capacity: Self.hashSize)
+        self.head.initialize(repeating: -1, count: Self.hashSize)
+        self.chain = .allocate(capacity: Self.chainSize)
+        self.chain.initialize(repeating: -1, count: Self.chainSize)
+        self.symbols = .allocate(capacity: Self.maxBlockSymbols + 8)
         self.windowSize = 1 << max(9, min(15, Int(windowBits)))
+    }
+
+    deinit {
+        self.head.deallocate()
+        self.chain.deallocate()
+        self.symbols.deallocate()
     }
 
     // -- what a caller can change or carry over ------------------------------------
@@ -173,7 +215,9 @@ struct DeflateCore: ~Copyable {
         self.effort = Effort(
             maxChainLength: max(0, maxChainLength),
             goodMatch: max(0, goodMatch),
-            maxLazy: max(0, maxLazy)
+            maxLazy: max(0, maxLazy),
+            quarterAt: max(0, goodMatch),
+            maxInsert: .max
         )
     }
 
@@ -195,11 +239,15 @@ struct DeflateCore: ~Copyable {
         )
 
         self.pending.append(contentsOf: slice)
-        self.chain.append(contentsOf: [Int](repeating: -1, count: slice.count))
 
         // Hashed so matches can find it, then stepped over: these bytes are context, not input.
-        for position in 0 ..< self.pending.count {
-            self.insert(at: position)
+        let snapshot = self.pending
+        snapshot.withUnsafeBufferPointer { buffer in
+            guard let bytes = buffer.baseAddress else { return }
+
+            for position in 0 ..< buffer.count {
+                self.insert(bytes, at: position, limit: buffer.count)
+            }
         }
 
         self.cursor = self.pending.count
@@ -238,10 +286,15 @@ struct DeflateCore: ~Copyable {
         clone.windowSize = self.windowSize
         clone.pending = self.pending
         clone.cursor = self.cursor
-        clone.head = self.head
-        clone.chain = self.chain
+
+        // The two raw buffers are the fields a memberwise copy would silently share; copying
+        // them is most of what this method exists to do.
+        clone.head.update(from: self.head, count: Self.hashSize)
+        clone.chain.update(from: self.chain, count: Self.chainSize)
+
         clone.writer = self.writer
-        clone.symbols = self.symbols
+        clone.symbols.update(from: self.symbols, count: self.symbolCount)
+        clone.symbolCount = self.symbolCount
         clone.blockStart = self.blockStart
         clone.deferred = self.deferred
         clone.literalFrequencies = self.literalFrequencies
@@ -271,7 +324,6 @@ struct DeflateCore: ~Copyable {
         guard !bytes.isEmpty else { return }
 
         self.pending.append(contentsOf: bytes)
-        self.chain.append(contentsOf: [Int](repeating: -1, count: bytes.count))
     }
 
     typealias Ending = Deflate.Ending
@@ -345,33 +397,51 @@ struct DeflateCore: ~Copyable {
 
     // -- matching --------------------------------------------------------------
 
-    private func hash(at position: Int) -> Int {
-        let a = Int(self.pending[position])
-        let b = Int(self.pending[position + 1])
-        let c = Int(self.pending[position + 2])
+    private func hash(_ bytes: UnsafePointer<UInt8>, at position: Int) -> Int {
+        let a = Int(bytes[position])
+        let b = Int(bytes[position + 1])
+        let c = Int(bytes[position + 2])
 
         // A multiplicative hash over three bytes, masked to the table size. The constant is odd
         // and spread across its bits, which is all this needs to scatter well.
         return ((a &<< 10) ^ (b &<< 5) ^ c) &* 0x9E37 & (Self.hashSize - 1)
     }
 
-    private mutating func insert(at position: Int) {
-        guard position + Self.minMatch <= self.pending.count else { return }
+    private mutating func insert(_ bytes: UnsafePointer<UInt8>, at position: Int, limit: Int) {
+        guard position + Self.minMatch <= limit else { return }
 
-        let key = self.hash(at: position)
-        self.chain[position] = self.head[key]
+        let key = self.hash(bytes, at: position)
+        self.chain[position & Self.chainMask] = self.head[key]
         self.head[key] = position
     }
 
     /// The longest match at `position`, or nil when nothing reaches the minimum length.
-    private func longestMatch(at position: Int, limit: Int) -> (length: Int, distance: Int)? {
+    ///
+    /// The chain walk runs over an unsafe view of `pending` and compares eight bytes per step,
+    /// finding the first difference with a XOR and a trailing-zero count. Everything about
+    /// *which* match wins is unchanged — same walk order, same tie-breaking, same caps — so
+    /// the emitted stream is byte-for-byte what the byte-at-a-time loop produced.
+    private func longestMatch(
+        _ bytes: UnsafePointer<UInt8>,
+        at position: Int,
+        limit: Int,
+        holding: Int = 0
+    ) -> (length: Int, distance: Int)? {
         guard position + Self.minMatch <= limit else { return nil }
 
         let maxLength = min(Self.maxMatch, limit - position)
         guard maxLength >= Self.minMatch else { return nil }
 
-        var candidate = self.head[self.hash(at: position)]
+        let here = bytes + position
+
+        var candidate = self.head[self.hash(bytes, at: position)]
         var chainLeft = self.effort.maxChainLength
+
+        // A quarter of the budget while a good match is already held: beating it is unlikely,
+        // so little is spent trying. The reference's `good_length`, doing exactly this.
+        if self.effort.quarterAt > 0, holding >= self.effort.quarterAt {
+            chainLeft >>= 2
+        }
         var best = 0
         var bestDistance = 0
 
@@ -380,11 +450,40 @@ struct DeflateCore: ~Copyable {
         while candidate >= earliest, chainLeft > 0 {
             chainLeft -= 1
 
-            var length = 0
+            let match = bytes + candidate
 
-            while length < maxLength,
-                  self.pending[candidate + length] == self.pending[position + length] {
-                length += 1
+            // A candidate that cannot *beat* the current best differs from it at or
+            // before the byte where the best ends, and checking that one byte first
+            // skips the losers without measuring them. Only candidates that survive
+            // get the full comparison, so the winner is the same one as ever.
+            if best > 0, match[best] != here[best] {
+                let next = self.chain[candidate & Self.chainMask]
+                if next >= candidate { break }
+                candidate = next
+                continue
+            }
+
+            var length = 0
+            var found = false
+
+            while length + 8 <= maxLength {
+                let a = UnsafeRawPointer(here + length).loadUnaligned(as: UInt64.self)
+                let b = UnsafeRawPointer(match + length).loadUnaligned(as: UInt64.self)
+                let difference = UInt64(littleEndian: a) ^ UInt64(littleEndian: b)
+
+                if difference != 0 {
+                    length += difference.trailingZeroBitCount >> 3
+                    found = true
+                    break
+                }
+
+                length += 8
+            }
+
+            if !found {
+                while length < maxLength, match[length] == here[length] {
+                    length += 1
+                }
             }
 
             if length > best {
@@ -392,9 +491,10 @@ struct DeflateCore: ~Copyable {
                 bestDistance = position - candidate
 
                 if best >= self.effort.goodMatch { break }
+                if best >= maxLength { break } // nothing left to beat
             }
 
-            let next = self.chain[candidate]
+            let next = self.chain[candidate & Self.chainMask]
             if next >= candidate { break }
             candidate = next
         }
@@ -406,65 +506,92 @@ struct DeflateCore: ~Copyable {
 
     private mutating func compressAvailable(keepingBack keepBack: Int) {
         let limit = self.pending.count
-
-        // Level zero asks for no match search at all, so there is nothing to be lazy about.
-        guard self.effort.maxChainLength > 0 else {
-            while self.cursor + keepBack < limit {
-                self.appendLiteral(self.pending[self.cursor])
-                self.cursor += 1
-
-                if self.blockIsFull { self.flushBlock(final: false) }
-            }
-
+        guard self.cursor + keepBack < limit else {
             self.trimWindow()
             return
         }
 
-        while self.cursor + keepBack < limit {
-            let current = self.longestMatch(at: self.cursor, limit: limit)
-            self.insert(at: self.cursor)
+        // The loops run over an unsafe view of a *local* handle on `pending`, which is what
+        // makes the interleaved mutation legal: the borrow is of the local, and nothing in
+        // here grows or shrinks the shared storage while the pointer is live.
+        let snapshot = self.pending
 
-            if let held = self.deferred {
-                if let current, current.length > held.length {
-                    // Starting a byte later pays better, so the byte the held match began on
-                    // becomes a literal and the new match is held in its place.
-                    self.appendLiteral(self.pending[self.cursor - 1])
-                    self.deferred = current
+        snapshot.withUnsafeBufferPointer { buffer in
+            guard let bytes = buffer.baseAddress else { return }
+
+            // Level zero asks for no match search at all, so there is nothing to be lazy about.
+            guard self.effort.maxChainLength > 0 else {
+                while self.cursor + keepBack < limit {
+                    self.appendLiteral(bytes[self.cursor])
                     self.cursor += 1
-                } else {
-                    self.take(held, startingAt: self.cursor - 1)
+
+                    if self.blockIsFull { self.flushBlock(final: false) }
                 }
-            } else if let current {
-                // A match already long enough is taken without looking further: past the level's
-                // threshold the search costs more than the byte it might save.
-                if current.length < self.effort.maxLazy {
-                    self.deferred = current
-                    self.cursor += 1
-                } else {
-                    self.take(current, startingAt: self.cursor)
-                }
-            } else {
-                self.appendLiteral(self.pending[self.cursor])
-                self.cursor += 1
+                return
             }
 
-            if self.blockIsFull { self.flushBlock(final: false) }
+            while self.cursor + keepBack < limit {
+                let heldLength = self.deferred?.length ?? 0
+
+                // The reference's economy, adopted whole: while a match at least `maxLazy`
+                // long is already in hand, no better one is even looked for — the search
+                // would usually lose, and it is the single most expensive thing here.
+                let current: (length: Int, distance: Int)? =
+                    heldLength > 0 && heldLength >= self.effort.maxLazy
+                    ? nil
+                    : self.longestMatch(bytes, at: self.cursor, limit: limit, holding: heldLength)
+
+                self.insert(bytes, at: self.cursor, limit: limit)
+
+                if let held = self.deferred {
+                    if let current, current.length > held.length {
+                        // Starting a byte later pays better, so the byte the held match began
+                        // on becomes a literal and the new match is held in its place.
+                        self.appendLiteral(bytes[self.cursor - 1])
+                        self.deferred = current
+                        self.cursor += 1
+                    } else {
+                        self.take(held, startingAt: self.cursor - 1, bytes: bytes, limit: limit)
+                    }
+                } else if let current {
+                    // A match already long enough is taken without looking further: past the
+                    // level's threshold the search costs more than the byte it might save.
+                    if current.length < self.effort.maxLazy {
+                        self.deferred = current
+                        self.cursor += 1
+                    } else {
+                        self.take(current, startingAt: self.cursor, bytes: bytes, limit: limit)
+                    }
+                } else {
+                    self.appendLiteral(bytes[self.cursor])
+                    self.cursor += 1
+                }
+
+                if self.blockIsFull { self.flushBlock(final: false) }
+            }
         }
 
         self.trimWindow()
     }
 
     /// Commits to a match, and puts the positions it covers into the hash chain.
-    private mutating func take(_ match: (length: Int, distance: Int), startingAt start: Int) {
+    private mutating func take(
+        _ match: (length: Int, distance: Int),
+        startingAt start: Int,
+        bytes: UnsafePointer<UInt8>,
+        limit: Int
+    ) {
         self.appendMatch(length: match.length, distance: match.distance)
 
         // `start` and `cursor` are already in the chain — every position passes through the top
-        // of the loop above — so only what the match covers beyond them is left to insert.
+        // of the loop above — so only what the match covers beyond them is left to insert. At
+        // the greedy levels a long match's insides are not indexed at all, as the reference
+        // has it: the run's head already is, and hashing the rest costs more than it finds.
         let end = start + match.length
 
-        if end > self.cursor + 1 {
+        if end > self.cursor + 1, match.length <= self.effort.maxInsert {
             for position in (self.cursor + 1) ..< end {
-                self.insert(at: position)
+                self.insert(bytes, at: position, limit: limit)
             }
         }
 
@@ -476,12 +603,17 @@ struct DeflateCore: ~Copyable {
     /// symbols. Nothing may be written out while a match is still undecided.
     private mutating func resolveDeferred() {
         guard let held = self.deferred else { return }
-        self.take(held, startingAt: self.cursor - 1)
+
+        let snapshot = self.pending
+        snapshot.withUnsafeBufferPointer { buffer in
+            guard let bytes = buffer.baseAddress else { return }
+            self.take(held, startingAt: self.cursor - 1, bytes: bytes, limit: buffer.count)
+        }
     }
 
     private var blockIsFull: Bool {
         self.emittedEnd - self.blockStart >= Self.maxBlockBytes
-            || self.symbols.count >= Self.maxBlockSymbols
+            || self.symbolCount >= Self.maxBlockSymbols
     }
 
     /// Drops history no match can reach any more, so `pending` does not grow with the stream.
@@ -490,20 +622,25 @@ struct DeflateCore: ~Copyable {
         guard self.cursor > keep * 2 else { return }
 
         // Never drop what the open block has not been written out of: if it closes as a stored
-        // block, those bytes are what it writes.
-        let drop = min(self.cursor - keep, self.blockStart)
+        // block, those bytes are what it writes. And only whole multiples of the chain ring:
+        // a position's slot is `position & chainMask`, so a rebase by anything else would move
+        // every entry to a slot nothing will ever read it from. The reference slides its
+        // window in the same fixed steps for the same reason.
+        let drop = min(self.cursor - keep, self.blockStart) & ~Self.chainMask
         guard drop > 0 else { return }
 
         self.pending.removeFirst(drop)
-        self.chain.removeFirst(drop)
         self.cursor -= drop
         self.blockStart -= drop
 
-        for index in 0 ..< self.head.count {
+        for index in 0 ..< Self.hashSize {
             self.head[index] = self.head[index] >= drop ? self.head[index] - drop : -1
         }
 
-        for index in 0 ..< self.chain.count {
+        // The ring's slots stay where they are — `(position - drop) & chainMask` is not
+        // `position & chainMask`, but the slot for a position is only ever *read* through the
+        // same masked arithmetic it was written through, so only the values need rebasing.
+        for index in 0 ..< Self.chainSize {
             self.chain[index] = self.chain[index] >= drop ? self.chain[index] - drop : -1
         }
     }
@@ -511,14 +648,14 @@ struct DeflateCore: ~Copyable {
     // -- collecting a block's symbols --------------------------------------------
 
     private mutating func appendLiteral(_ byte: UInt8) {
-        self.symbols.append(UInt32(byte))
+        self.symbols[self.symbolCount] = UInt32(byte)
+        self.symbolCount += 1
         self.literalFrequencies[Int(byte)] += 1
     }
 
     private mutating func appendMatch(length: Int, distance: Int) {
-        self.symbols.append(
-            0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
-        )
+        self.symbols[self.symbolCount] = 0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
+        self.symbolCount += 1
 
         let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
         let distanceSymbol = Self.distanceSymbol(for: distance)
@@ -592,7 +729,7 @@ struct DeflateCore: ~Copyable {
             self.writer.alignToByte()
         }
 
-        self.symbols.removeAll(keepingCapacity: true)
+        self.symbolCount = 0
         self.extraBits = 0
         self.blockStart = blockEnd
 
@@ -622,11 +759,11 @@ struct DeflateCore: ~Copyable {
     /// flushed, so what is dropped is pure history.
     private mutating func resetWindow() {
         self.pending.removeAll(keepingCapacity: true)
-        self.chain.removeAll(keepingCapacity: true)
         self.cursor = 0
         self.blockStart = 0
 
-        for index in self.head.indices {
+        // `chain` needs no clearing: its meaningful length is `pending.count`, now zero.
+        for index in 0 ..< Self.hashSize {
             self.head[index] = -1
         }
     }
@@ -667,7 +804,8 @@ struct DeflateCore: ~Copyable {
         self.writer.write(final ? 1 : 0, bits: 1)
         self.writer.write(1, bits: 2)
 
-        for symbol in self.symbols {
+        for index in 0 ..< self.symbolCount {
+            let symbol = self.symbols[index]
             guard symbol & 0x8000_0000 != 0 else {
                 self.writeLiteralOrLength(UInt16(truncatingIfNeeded: symbol))
                 continue
@@ -688,7 +826,8 @@ struct DeflateCore: ~Copyable {
 
         table.writeTable(to: &self.writer)
 
-        for symbol in self.symbols {
+        for index in 0 ..< self.symbolCount {
+            let symbol = self.symbols[index]
             guard symbol & 0x8000_0000 != 0 else {
                 let literal = Int(symbol & 0xFF)
                 self.writer.writeCode(
