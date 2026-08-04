@@ -7,15 +7,17 @@ import Testing
 /// test is that contract — a round trip that re-offers unconsumed input the way a real caller
 /// must, driven through buffers small enough that every resumption path runs.
 // The engine's span entry points back-deploy with Span itself; `Array.span`, which these
-// tests lean on for convenience, does not. The availability is the accessor's, not the API's.
+// tests lean on for convenience, does not. The availability is the accessor's, not the
+// API's — and it sits on each test rather than the suite because the @Test macro insists
+// on seeing it directly.
 @Suite("Span API")
-@available(macOS 26.0, *)
 struct SpanAPITests {
     static let payload = Array(
         (String(repeating: "the quick brown fox jumps over the lazy dog. ", count: 200)).utf8
     )
 
     /// Compresses and decompresses entirely through spans, in awkward chunk sizes.
+    @available(macOS 26.0, *)
     static func roundTrip(feeding feed: Int, collecting collect: Int) throws -> [UInt8] {
         let compressor = Compressor(level: 6)
         var compressed: [UInt8] = []
@@ -89,11 +91,13 @@ struct SpanAPITests {
     }
 
     @Test("Round trip through spans, whole buffers")
+    @available(macOS 26.0, *)
     func wholeBuffers() throws {
         #expect(try Self.roundTrip(feeding: Self.payload.count, collecting: 16384) == Self.payload)
     }
 
     @Test("Round trip through spans, awkward chunks", arguments: [(7, 13), (64, 64), (1, 4096)])
+    @available(macOS 26.0, *)
     func chunked(_ sizes: (Int, Int)) throws {
         #expect(try Self.roundTrip(feeding: sizes.0, collecting: sizes.1) == Self.payload)
     }
@@ -101,6 +105,7 @@ struct SpanAPITests {
     /// Unconsumed input re-offered is the contract; input dropped on the floor is the bug this
     /// would catch: a decoder that lost track would either stall or produce a short result.
     @Test("A one-byte output buffer forces maximal re-offering")
+    @available(macOS 26.0, *)
     func maximalReoffering() throws {
         #expect(try Self.roundTrip(feeding: 3, collecting: 1) == Self.payload)
     }
