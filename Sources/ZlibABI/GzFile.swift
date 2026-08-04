@@ -26,6 +26,8 @@
 import Glibc
 #elseif canImport(Android)
 import Android
+#elseif canImport(Musl)
+import Musl
 #elseif canImport(Darwin)
 import Darwin
 #endif
@@ -150,7 +152,7 @@ final class GzFile {
 
     /// Where the file is positioned in its *compressed* bytes, which `gzoffset` reports.
     var compressedOffset: Int64 {
-        let raw = lseek(self.descriptor, 0, SEEK_CUR)
+        let raw = systemSeek(self.descriptor, 0, SEEK_CUR)
         guard raw >= 0 else { return -1 }
 
         // Whatever has been read from the file but not yet decoded is not part of what has been
@@ -456,7 +458,7 @@ final class GzFile {
     /// Rewinds a file being read, so that seeking backwards has somewhere to start.
     func rewind() -> Bool {
         guard self.mode == .read else { return false }
-        guard lseek(self.descriptor, 0, SEEK_SET) >= 0 else {
+        guard systemSeek(self.descriptor, 0, SEEK_SET) >= 0 else {
             self.fail(Status.errno, "cannot seek")
             return false
         }
