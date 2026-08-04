@@ -1,0 +1,75 @@
+# Android is the platform where a zlib with no C library underneath is most likely to be
+# load-bearing, and its libc is neither Glibc nor Darwin — Bionic arrives as `import Android`
+# — so nothing short of building for it proves the platform seams are right.
+#
+# Two jobs, because GitHub's runners can only hardware-accelerate an x86_64 emulator: that
+# one architecture runs the whole test suite for real, and the ARM ABIs — the ones actual
+# devices use — are compile-checked by cross-building the same tests they cannot run.
+
+name: Android
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Android (x86_64, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the tests on the Android x86_64 emulator
+        uses: skiptools/swift-android-action@v2
+        with:
+          swift-version: 6.3.2
+          run-tests: true
+          build-tests: true
+          free-disk-space: true
+
+  build-arm:
+    name: Android (${{ matrix.arch }}, build)
+    runs-on: ubuntu-latest
+    container: swift:6.3.2-jammy
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            triple: aarch64-unknown-linux-android28
+          - arch: armv7
+            triple: armv7-unknown-linux-android28
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Android Swift SDK and NDK sysroot
+        # The official swift.org Android SDK bundle declares `sdkRootPath: ndk-sysroot` but
+        # ships no sysroot of its own; the setup script it does ship builds one from a
+        # separately installed NDK. The bundle's oldest supported API level is 28, hence the
+        # android28 triples. The container's default shell is dash, which has no `pipefail`.
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update && apt-get install -y curl unzip
+          swift sdk install https://download.swift.org/swift-6.3.2-release/android-sdk/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE_android.artifactbundle.tar.gz --checksum 939e933549d12d28f2e0bf71019d734d309859e9773c572657ce565a81f85d68
+          # SwiftPM resolves its data directory from the passwd entry rather than $HOME, so
+          # inside the container the bundle can land under /root even though $HOME is
+          # /github/home. Probe the known locations.
+          for candidate in "${HOME}/.swiftpm" "${HOME}/.config/swiftpm" "${HOME}/.local/swiftpm" /root/.swiftpm; do
+            if [ -d "${candidate}/swift-sdks/swift-6.3.2-RELEASE_android.artifactbundle/swift-android" ]; then
+              SWIFTPM_DIR="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${SWIFTPM_DIR:-}" ]; then
+            echo "Could not locate the installed Android Swift SDK bundle" >&2
+            swift sdk list >&2 || true
+            exit 1
+          fi
+          cd "${SWIFTPM_DIR}"
+          curl -fSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -qo ndk.zip
+          rm ndk.zip
+          export ANDROID_NDK_HOME="$PWD/android-ndk-r27d"
+          ./swift-sdks/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/scripts/setup-android-sdk.sh
+      - name: Build the package and its tests for Android ${{ matrix.arch }}
+        run: swift build --build-tests --swift-sdk ${{ matrix.triple }}
