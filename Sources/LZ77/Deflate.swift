@@ -364,44 +364,84 @@ struct DeflateCore: ~Copyable {
     }
 
     /// The longest match at `position`, or nil when nothing reaches the minimum length.
+    ///
+    /// The chain walk runs over an unsafe view of `pending` and compares eight bytes per step,
+    /// finding the first difference with a XOR and a trailing-zero count. Everything about
+    /// *which* match wins is unchanged — same walk order, same tie-breaking, same caps — so
+    /// the emitted stream is byte-for-byte what the byte-at-a-time loop produced.
     private func longestMatch(at position: Int, limit: Int) -> (length: Int, distance: Int)? {
         guard position + Self.minMatch <= limit else { return nil }
 
         let maxLength = min(Self.maxMatch, limit - position)
         guard maxLength >= Self.minMatch else { return nil }
 
-        var candidate = self.head[self.hash(at: position)]
-        var chainLeft = self.effort.maxChainLength
-        var best = 0
-        var bestDistance = 0
+        return self.pending.withUnsafeBufferPointer { buffer in
+            let bytes = buffer.baseAddress!
+            let here = bytes + position
 
-        let earliest = max(0, position - self.windowSize)
+            var candidate = self.head[self.hash(at: position)]
+            var chainLeft = self.effort.maxChainLength
+            var best = 0
+            var bestDistance = 0
 
-        while candidate >= earliest, chainLeft > 0 {
-            chainLeft -= 1
+            let earliest = max(0, position - self.windowSize)
 
-            var length = 0
+            while candidate >= earliest, chainLeft > 0 {
+                chainLeft -= 1
 
-            while length < maxLength,
-                  self.pending[candidate + length] == self.pending[position + length] {
-                length += 1
+                let match = bytes + candidate
+
+                // A candidate that cannot *beat* the current best differs from it at or
+                // before the byte where the best ends, and checking that one byte first
+                // skips the losers without measuring them. Only candidates that survive
+                // get the full comparison, so the winner is the same one as ever.
+                if best > 0, match[best] != here[best] {
+                    let next = self.chain[candidate]
+                    if next >= candidate { break }
+                    candidate = next
+                    continue
+                }
+
+                var length = 0
+                var found = false
+
+                while length + 8 <= maxLength {
+                    let a = UnsafeRawPointer(here + length).loadUnaligned(as: UInt64.self)
+                    let b = UnsafeRawPointer(match + length).loadUnaligned(as: UInt64.self)
+                    let difference = UInt64(littleEndian: a) ^ UInt64(littleEndian: b)
+
+                    if difference != 0 {
+                        length += difference.trailingZeroBitCount >> 3
+                        found = true
+                        break
+                    }
+
+                    length += 8
+                }
+
+                if !found {
+                    while length < maxLength, match[length] == here[length] {
+                        length += 1
+                    }
+                }
+
+                if length > best {
+                    best = length
+                    bestDistance = position - candidate
+
+                    if best >= self.effort.goodMatch { break }
+                    if best >= maxLength { break } // nothing left to beat
+                }
+
+                let next = self.chain[candidate]
+                if next >= candidate { break }
+                candidate = next
             }
 
-            if length > best {
-                best = length
-                bestDistance = position - candidate
+            guard best >= Self.minMatch else { return nil }
 
-                if best >= self.effort.goodMatch { break }
-            }
-
-            let next = self.chain[candidate]
-            if next >= candidate { break }
-            candidate = next
+            return (best, bestDistance)
         }
-
-        guard best >= Self.minMatch else { return nil }
-
-        return (best, bestDistance)
     }
 
     private mutating func compressAvailable(keepingBack keepBack: Int) {
