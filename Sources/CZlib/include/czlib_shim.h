@@ -20,6 +20,16 @@
 #define _LARGEFILE64_SOURCE 1
 #endif
 
+/* Z_LARGE64 makes zlib.h spell the *64 declarations in terms of off64_t, which is a glibc and
+ * Bionic name: Darwin and musl never had a separate 64-bit off_t because their off_t always
+ * was one. Supplying the typedef here is what lets those platforms compile the same
+ * declarations — and on musl it is at worst an identical redeclaration, which C11 permits.
+ */
+#include <sys/types.h>
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__))
+typedef long long off64_t;
+#endif
+
 /* Defined with no value, exactly as zconf.h defines it for itself when the platform has
  * large-file support. An identical redefinition is allowed; `#define Z_LARGE64 1` would not be,
  * and warns. The definition is still needed here for platforms where zconf.h would not reach
