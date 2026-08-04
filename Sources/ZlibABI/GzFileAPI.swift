@@ -19,6 +19,10 @@
 
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Android)
+import Android
+#elseif canImport(Musl)
+import Musl
 #elseif canImport(Darwin)
 import Darwin
 #endif
@@ -83,7 +87,7 @@ private func withFile<T>(_ file: gzFile?, _ fallback: T, _ body: (GzFile) -> T) 
     defer {
         file.pointee.have = UInt32(state.availableOutput)
         file.pointee.next = state.outputPointer
-        file.pointee.pos = Int(state.position)
+        file.pointee.pos = off64_t(state.position)
     }
 
     return body(state)
@@ -157,7 +161,7 @@ private func open(_ path: UnsafePointer<CChar>?, _ mode: UnsafePointer<CChar>?) 
         if parsed.exclusive { flags |= O_EXCL }
     }
 
-    let descriptor = Glibc.open(path, flags, 0o666)
+    let descriptor = systemOpen(path, flags, 0o666)
     guard descriptor >= 0 else { return nil }
 
     return attachFile(descriptor, parsed)
@@ -381,33 +385,33 @@ public func gzsetparams(_ file: gzFile!, _ level: Int32, _ strategy: Int32) -> I
 // -- position and state --------------------------------------------------------
 
 @c @implementation
-public func gztell(_ file: gzFile!) -> Int {
-    withFile(file, -1) { Int($0.position) }
+public func gztell(_ file: gzFile!) -> off_t {
+    withFile(file, -1) { off_t($0.position) }
 }
 
 @c @implementation
-public func gztell64(_ file: gzFile!) -> Int {
-    gztell(file)
+public func gztell64(_ file: gzFile!) -> off64_t {
+    off64_t(gztell(file))
 }
 
 @c @implementation
-public func gzoffset(_ file: gzFile!) -> Int {
-    withFile(file, -1) { Int($0.compressedOffset) }
+public func gzoffset(_ file: gzFile!) -> off_t {
+    withFile(file, -1) { off_t($0.compressedOffset) }
 }
 
 @c @implementation
-public func gzoffset64(_ file: gzFile!) -> Int {
-    gzoffset(file)
+public func gzoffset64(_ file: gzFile!) -> off64_t {
+    off64_t(gzoffset(file))
 }
 
 @c @implementation
-public func gzseek(_ file: gzFile!, _ offset: Int, _ whence: Int32) -> Int {
-    seek(file, Int64(offset), whence)
+public func gzseek(_ file: gzFile!, _ offset: off_t, _ whence: Int32) -> off_t {
+    off_t(seek(file, Int64(offset), whence))
 }
 
 @c @implementation
-public func gzseek64(_ file: gzFile!, _ offset: Int, _ whence: Int32) -> Int {
-    seek(file, Int64(offset), whence)
+public func gzseek64(_ file: gzFile!, _ offset: off64_t, _ whence: Int32) -> off64_t {
+    off64_t(seek(file, Int64(offset), whence))
 }
 
 private func seek(_ file: gzFile?, _ offset: Int64, _ whence: Int32) -> Int {

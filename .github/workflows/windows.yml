@@ -1,0 +1,33 @@
+# Windows builds the engine and runs its tests, and deliberately not the rest: the gz file
+# layer speaks POSIX — open, read, lseek, EINTR — which Glibc, Bionic and Darwin all provide
+# and the Windows CRT does not, and the installable libz.so.1 is a Linux artifact anyway. The
+# tests depend only on the engine modules, so building the test product pulls in exactly the
+# part that claims portability and none of the part that does not.
+
+name: Windows
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.config }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [debug, release]
+    steps:
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-6.3.2-release
+          tag: 6.3.2-RELEASE
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Build the engine and its tests
+        # -enable-testing because the tests import the engine @testable, and unlike
+        # `swift test`, a plain build does not switch it on for release configurations.
+        run: swift build -c ${{ matrix.config }} --product swift-zlibPackageTests -Xswiftc -enable-testing
+      - name: Test
+        run: swift test -c ${{ matrix.config }} --skip-build

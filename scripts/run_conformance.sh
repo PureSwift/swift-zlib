@@ -76,10 +76,15 @@ fi
 echo
 echo "compressed size vs reference:"
 paste <(grep '^SIZE:' "$WORK/reference.out") <(grep '^SIZE:' "$WORK/candidate.out") |
-    awk '{
-        # Each SIZE line is "SIZE: <name> <level> <bytes> (bound <n>)", and paste puts the
-        # reference line and ours side by side, so ours starts at field 7.
-        name = $2; level = $3; ref = $4; ours = $10;
+    awk -F'\t' '{
+        # paste holds the reference line and ours apart with a tab. The lines themselves come
+        # in more than one shape — "SIZE: <name> <level> <bytes> (bound <n>)" from zstream,
+        # "SIZE: <name> <level> <bytes>" and "SIZE: <name> <bytes>" from zgzfile — so the
+        # bytes are found by looking, not counted to by position.
+        split($1, a, /[ ]+/); split($2, b, /[ ]+/);
+        name = a[2];
+        if (a[3] ~ /^[0-9]+$/) { level = "";   ref = a[3] + 0; ours = b[3] + 0 }
+        else                   { level = a[3]; ref = a[4] + 0; ours = b[4] + 0 }
         ratio = ref > 0 ? ours / ref : 1;
         printf "  %-10s %-4s reference %10d   ours %10d   %+.1f%%\n",
                name, level, ref, ours, (ratio - 1) * 100;

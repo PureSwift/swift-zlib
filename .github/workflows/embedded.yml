@@ -1,0 +1,51 @@
+# The engine has to keep building for targets with no operating system under them, and that
+# property is easy to break from an ordinary desktop build without noticing: one existential
+# in an error path is enough, and nothing else in CI would say so.
+#
+# Two jobs check it two ways. `bare-metal` is scripts/check_embedded.sh — a real round trip
+# under Embedded Swift on the host, then compilation for three bare-metal triples, all driven
+# by swiftc alone, the way an embedded project's own build system would. `wasm` checks the
+# same restriction through SwiftPM instead, with the one embedded SDK that ships in release
+# form — so a manifest change that quietly breaks embedded building fails here, where the
+# swiftc path would never see the manifest at all.
+
+name: Embedded
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  bare-metal:
+    name: Round trip, and bare metal
+    runs-on: ubuntu-latest
+    container: swift:6.3-noble
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check_embedded.sh
+
+  wasm:
+    name: WebAssembly (${{ matrix.target }}, ${{ matrix.config }})
+    runs-on: ubuntu-latest
+    # Pinned to the SDK's exact toolchain, not a floating tag: a Swift SDK's modules are only
+    # importable by the compiler version that built them.
+    container: swift:6.3.3-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [LZ77, Zlib, GZip]
+        config: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the WebAssembly SDK
+        # The checksum is required rather than optional, and pinned rather than fetched: an
+        # SDK that installs whatever the URL happens to be serving is not a fixed thing to
+        # have tested against.
+        run: >
+          swift sdk install
+          "https://download.swift.org/swift-6.3.3-release/wasm-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_wasm.artifactbundle.tar.gz"
+          --checksum cabfa08b73bb8ac783927ecd15fa386e99d0c139c5f232445067bcf58379cae7
+      - name: Build ${{ matrix.target }} for embedded WebAssembly
+        run: >
+          swift build -c ${{ matrix.config }} --target ${{ matrix.target }}
+          --swift-sdk swift-6.3.3-RELEASE_wasm-embedded

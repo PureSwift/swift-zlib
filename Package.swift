@@ -18,6 +18,9 @@ import PackageDescription
 
 let package = Package(
     name: "swift-zlib",
+    // The floor `Span` and `OutputSpan` back-deploy to. Only Apple platforms need saying:
+    // everywhere else the standard library ships with the compiler.
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "Zlib", targets: ["Zlib"]),
         .library(name: "GZip", targets: ["GZip"]),

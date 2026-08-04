@@ -24,6 +24,10 @@
 
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Android)
+import Android
+#elseif canImport(Musl)
+import Musl
 #elseif canImport(Darwin)
 import Darwin
 #endif
@@ -148,7 +152,7 @@ final class GzFile {
 
     /// Where the file is positioned in its *compressed* bytes, which `gzoffset` reports.
     var compressedOffset: Int64 {
-        let raw = lseek(self.descriptor, 0, SEEK_CUR)
+        let raw = systemSeek(self.descriptor, 0, SEEK_CUR)
         guard raw >= 0 else { return -1 }
 
         // Whatever has been read from the file but not yet decoded is not part of what has been
@@ -323,7 +327,7 @@ final class GzFile {
         _ count: Int
     ) -> Int {
         while true {
-            let got = Glibc.read(descriptor, destination, count)
+            let got = systemRead(descriptor, destination, count)
             if got >= 0 { return got }
             if errno == EINTR { continue }
             return -1
@@ -408,7 +412,7 @@ final class GzFile {
         var written = 0
 
         while written < count {
-            let put = Glibc.write(self.descriptor, bytes + written, count - written)
+            let put = systemWrite(self.descriptor, bytes + written, count - written)
 
             if put < 0 {
                 if errno == EINTR { continue }
@@ -454,7 +458,7 @@ final class GzFile {
     /// Rewinds a file being read, so that seeking backwards has somewhere to start.
     func rewind() -> Bool {
         guard self.mode == .read else { return false }
-        guard lseek(self.descriptor, 0, SEEK_SET) >= 0 else {
+        guard systemSeek(self.descriptor, 0, SEEK_SET) >= 0 else {
             self.fail(Status.errno, "cannot seek")
             return false
         }
@@ -569,7 +573,7 @@ final class GzFile {
             if !self.flush(.finish) { status = self.errorCode }
         }
 
-        if self.ownsDescriptor, Glibc.close(self.descriptor) != 0 {
+        if self.ownsDescriptor, systemClose(self.descriptor) != 0 {
             status = Status.errno
         }
 

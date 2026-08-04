@@ -1,0 +1,25 @@
+# The engine claims to build wherever Swift does; this is where that claim meets a second
+# operating system. SwiftPM only: the installable libz.so.1 and the conformance suite stay on
+# Linux, where the reference to compare against lives. What macOS checks is the Swift surface,
+# the tests, and the Darwin branch of the gz file layer — the one branch a Linux build never
+# compiles.
+
+name: macOS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.config }})
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift build -c ${{ matrix.config }}
+      - run: swift test -c ${{ matrix.config }}

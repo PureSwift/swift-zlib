@@ -1,28 +1,59 @@
-# Everything this project claims is checked by a script; this is what runs them.
+# The Linux claims: the export list has to match the reference symbol for symbol, and the
+# behaviour has to match it call for call. Both are easy to break from an ordinary desktop
+# build without noticing, which is the whole reason they are scripts rather than paragraphs.
 #
-# The claims are not the kind that stay true on their own. The export list has to match the
-# reference symbol for symbol, the behaviour has to match it call for call, and the engine has
-# to keep building for a target with no operating system — and all three are easy to break from
-# an ordinary desktop build without noticing, which is the whole reason they are scripts rather
-# than paragraphs.
+# This workflow is Linux only because the conformance is: the reference to compare against
+# lives here, and so does the installable libz.so.1. The other platforms the engine builds
+# for each have a workflow of their own — macos.yml, windows.yml, android.yml — and the
+# no-operating-system configuration has embedded.yml.
 
 name: CI
 
 on:
   push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 jobs:
+  # arm64 runs on a real hosted ARM64 machine, not a cross-compilation target: the tests
+  # execute, which matters for an engine full of width-sensitive bit arithmetic.
   test:
-    name: Build and test
-    runs-on: ubuntu-latest
+    name: Build and test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: swift:6.3-noble
     steps:
       - uses: actions/checkout@v4
       - run: swift build
       - run: swift test
+
+  # musl instead of Glibc — the libc of Alpine and of Swift's fully static Linux binaries,
+  # and a different Swift platform module, so nothing short of building against it proves the
+  # platform seams are right. Build-only, in two senses: the static SDK ships no testing
+  # library to link a test product against, and its runtime archives are not built for
+  # linking into a shared library — so this builds every module through the C boundary and
+  # stops short of the one product the SDK cannot express.
+  musl:
+    name: Build (musl, static)
+    runs-on: ubuntu-latest
+    # Pinned to the SDK's exact toolchain, not a floating tag: a Swift SDK's modules are only
+    # importable by the compiler version that built them.
+    container: swift:6.3.3-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the static Linux SDK
+        run: >
+          swift sdk install
+          "https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz"
+          --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+      - name: Build every module, through the C boundary
+        run: swift build --swift-sdk x86_64-swift-linux-musl --target ZlibABI
 
   conformance:
     name: Conformance against the system libz
@@ -31,8 +62,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The reference to compare against, and the tools the checks are built with.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build zlib1g-dev python3
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build gcc make python3
+
+      # The reference to compare against, pinned by building it rather than taking whatever
+      # the distribution carries — noble's zlib is 1.3, and the first compared line is the
+      # version string. The distribution's zlib1g-dev is deliberately not installed, so there
+      # is only one zlib.h and one -lz to find.
+      - name: Build the reference zlib 1.3.1
+        run: |
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib
+          cd /tmp/zlib
+          ./configure
+          make -j"$(nproc)"
+          make install
+          ldconfig
+
       - run: cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/cmake
 
@@ -44,9 +88,9 @@ jobs:
       - run: ./scripts/run_conformance.sh build/cmake/libz.so.1.3.1
 
       # zlib's own test programs, built against this library unmodified.
+      # zlib's own test programs, from the clone the reference was built from.
       - name: zlib's own test suite
         run: |
-          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib
           cc -O1 -I Sources/CZlib/include -o /tmp/example \
             /tmp/zlib/test/example.c build/cmake/libz.so.1.3.1 \
             -Wl,-rpath,"$PWD/build/cmake"
@@ -61,14 +105,3 @@ jobs:
           gzip -dc /tmp/ours.gz | cmp - /tmp/payload
           gzip -c /tmp/payload > /tmp/theirs.gz
           /tmp/minigzip -d < /tmp/theirs.gz | cmp - /tmp/payload
-
-  embedded:
-    name: Embedded Swift
-    runs-on: ubuntu-latest
-    container: swift:6.3-noble
-    steps:
-      - uses: actions/checkout@v4
-      # A round trip under Embedded Swift on the host, then compilation for three bare-metal
-      # targets. One existential in an error path is enough to break this, and nothing else
-      # in this workflow would notice.
-      - run: ./scripts/check_embedded.sh

@@ -10,6 +10,20 @@
 // bytes. CRC-32 answers it in GF(2), because a CRC is a polynomial remainder and appending
 // `len2` zero bytes to A is multiplying its polynomial by x^(8·len2).
 
+// For `off_t` and `off64_t`, the types the header spells the combine lengths in. They differ
+// per platform in more than width: Glibc's off_t is `long` and imports as Int, Bionic's,
+// Musl's and Darwin's import as Int64 — so the signatures below name the C types and the
+// bodies convert, rather than betting on any one platform's spelling.
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Android)
+import Android
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
 import CZlib
 import GZip
 import Zlib
@@ -33,13 +47,13 @@ public func adler32_z(_ adler: UInt, _ buf: UnsafePointer<UInt8>!, _ len: Int) -
 }
 
 @c @implementation
-public func adler32_combine(_ adler1: UInt, _ adler2: UInt, _ len2: Int) -> UInt {
-    combineAdler32(adler1, adler2, len2)
+public func adler32_combine(_ adler1: UInt, _ adler2: UInt, _ len2: off_t) -> UInt {
+    combineAdler32(adler1, adler2, Int(len2))
 }
 
 @c @implementation
-public func adler32_combine64(_ adler1: UInt, _ adler2: UInt, _ len2: Int) -> UInt {
-    combineAdler32(adler1, adler2, len2)
+public func adler32_combine64(_ adler1: UInt, _ adler2: UInt, _ len2: off64_t) -> UInt {
+    combineAdler32(adler1, adler2, Int(len2))
 }
 
 /// The two sums are each linear in the bytes, so the combined pair follows from the two pairs
@@ -85,27 +99,27 @@ public func crc32_z(_ crc: UInt, _ buf: UnsafePointer<UInt8>!, _ len: Int) -> UI
 }
 
 @c @implementation
-public func crc32_combine(_ crc1: UInt, _ crc2: UInt, _ len2: Int) -> UInt {
-    crc32_combine_op(crc1, crc2, crc32_combine_gen64(len2))
+public func crc32_combine(_ crc1: UInt, _ crc2: UInt, _ len2: off_t) -> UInt {
+    crc32_combine_op(crc1, crc2, crc32_combine_gen64(off64_t(len2)))
 }
 
 @c @implementation
-public func crc32_combine64(_ crc1: UInt, _ crc2: UInt, _ len2: Int) -> UInt {
+public func crc32_combine64(_ crc1: UInt, _ crc2: UInt, _ len2: off64_t) -> UInt {
     crc32_combine_op(crc1, crc2, crc32_combine_gen64(len2))
 }
 
 /// Precomputes the operator for a given length, so a caller combining many blocks of the same
 /// size pays for the exponentiation once instead of per block.
 @c @implementation
-public func crc32_combine_gen(_ len2: Int) -> UInt {
-    crc32_combine_gen64(len2)
+public func crc32_combine_gen(_ len2: off_t) -> UInt {
+    crc32_combine_gen64(off64_t(len2))
 }
 
 @c @implementation
-public func crc32_combine_gen64(_ len2: Int) -> UInt {
+public func crc32_combine_gen64(_ len2: off64_t) -> UInt {
     // Appending `len2` bytes shifts the first CRC up by 8·len2 bits, and 8 is 2³ — so the
     // exponent starts three squarings in.
-    xToTheNModP(len2, 3)
+    xToTheNModP(Int(len2), 3)
 }
 
 @c @implementation
