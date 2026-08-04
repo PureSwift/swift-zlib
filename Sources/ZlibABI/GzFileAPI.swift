@@ -87,7 +87,7 @@ private func withFile<T>(_ file: gzFile?, _ fallback: T, _ body: (GzFile) -> T) 
     defer {
         file.pointee.have = UInt32(state.availableOutput)
         file.pointee.next = state.outputPointer
-        file.pointee.pos = Int(state.position)
+        file.pointee.pos = off64_t(state.position)
     }
 
     return body(state)
