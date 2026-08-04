@@ -62,17 +62,24 @@ struct DeflateCore: ~Copyable {
     private var pending: [UInt8] = []
     private var cursor = 0
 
-    /// head[hash] is the most recent position with that hash; chain[position] is the previous
-    /// one. Positions are indices into `pending`, rebased whenever it is trimmed.
+    /// head[hash] is the most recent position with that hash; chain[position & chainMask] is
+    /// the previous one. Positions are indices into `pending`, rebased whenever it is trimmed.
     ///
     /// Raw memory rather than arrays for the same reason as the decoder's window: these are
     /// touched for every input byte, this struct allocates and owns them outright, and an
     /// array's uniqueness and bounds checking buy nothing here but a branch per access.
-    /// `chain` grows in step with `pending`; `chainCapacity` is its allocation, not its
-    /// meaningful length, which is always `pending.count`.
+    ///
+    /// `chain` is a fixed ring the size of the largest window rather than an array running
+    /// the length of `pending`, and the difference is not memory but locality: a chain walk
+    /// hops all over this buffer, and 32K entries stay in cache where a buffer the length of
+    /// the input does not. The ring is sound because a slot is overwritten only by a position
+    /// exactly `chainSize` later — and by then the position it held is out of any window's
+    /// reach, which is the condition under which the walk already refuses to follow it.
     private var head: UnsafeMutablePointer<Int>
     private var chain: UnsafeMutablePointer<Int>
-    private var chainCapacity: Int
+
+    private static let chainSize = 1 << 15 // the largest windowSize
+    private static let chainMask = chainSize - 1
 
     private static let hashBits = 15
     private static let hashSize = 1 << hashBits
@@ -161,8 +168,8 @@ struct DeflateCore: ~Copyable {
         self.effort = Effort.forLevel(level)
         self.head = .allocate(capacity: Self.hashSize)
         self.head.initialize(repeating: -1, count: Self.hashSize)
-        self.chain = .allocate(capacity: 4096)
-        self.chainCapacity = 4096
+        self.chain = .allocate(capacity: Self.chainSize)
+        self.chain.initialize(repeating: -1, count: Self.chainSize)
         self.windowSize = 1 << max(9, min(15, Int(windowBits)))
         self.symbols.reserveCapacity(Self.maxBlockSymbols)
     }
@@ -170,27 +177,6 @@ struct DeflateCore: ~Copyable {
     deinit {
         self.head.deallocate()
         self.chain.deallocate()
-    }
-
-    /// Grows `chain` to cover `pending`, initializing the new tail to "no predecessor".
-    ///
-    /// Called immediately after `pending` grows, which is the invariant everything else
-    /// relies on: `chain[i]` exists and is meaningful exactly when `pending[i]` does.
-    private mutating func extendChain(from oldCount: Int) {
-        let needed = self.pending.count
-
-        if needed > self.chainCapacity {
-            var capacity = self.chainCapacity * 2
-            while capacity < needed { capacity *= 2 }
-
-            let grown = UnsafeMutablePointer<Int>.allocate(capacity: capacity)
-            grown.initialize(from: self.chain, count: oldCount)
-            self.chain.deallocate()
-            self.chain = grown
-            self.chainCapacity = capacity
-        }
-
-        (self.chain + oldCount).initialize(repeating: -1, count: needed - oldCount)
     }
 
     // -- what a caller can change or carry over ------------------------------------
@@ -230,9 +216,7 @@ struct DeflateCore: ~Copyable {
             count: bytes.count - start
         )
 
-        let oldCount = self.pending.count
         self.pending.append(contentsOf: slice)
-        self.extendChain(from: oldCount)
 
         // Hashed so matches can find it, then stepped over: these bytes are context, not input.
         let snapshot = self.pending
@@ -284,8 +268,7 @@ struct DeflateCore: ~Copyable {
         // The two raw buffers are the fields a memberwise copy would silently share; copying
         // them is most of what this method exists to do.
         clone.head.update(from: self.head, count: Self.hashSize)
-        clone.extendChain(from: 0)
-        clone.chain.update(from: self.chain, count: self.pending.count)
+        clone.chain.update(from: self.chain, count: Self.chainSize)
 
         clone.writer = self.writer
         clone.symbols = self.symbols
@@ -317,9 +300,7 @@ struct DeflateCore: ~Copyable {
     mutating func setInput(_ bytes: UnsafeBufferPointer<UInt8>) {
         guard !bytes.isEmpty else { return }
 
-        let oldCount = self.pending.count
         self.pending.append(contentsOf: bytes)
-        self.extendChain(from: oldCount)
     }
 
     typealias Ending = Deflate.Ending
@@ -407,7 +388,7 @@ struct DeflateCore: ~Copyable {
         guard position + Self.minMatch <= limit else { return }
 
         let key = self.hash(bytes, at: position)
-        self.chain[position] = self.head[key]
+        self.chain[position & Self.chainMask] = self.head[key]
         self.head[key] = position
     }
 
@@ -446,7 +427,7 @@ struct DeflateCore: ~Copyable {
             // skips the losers without measuring them. Only candidates that survive
             // get the full comparison, so the winner is the same one as ever.
             if best > 0, match[best] != here[best] {
-                let next = self.chain[candidate]
+                let next = self.chain[candidate & Self.chainMask]
                 if next >= candidate { break }
                 candidate = next
                 continue
@@ -483,7 +464,7 @@ struct DeflateCore: ~Copyable {
                 if best >= maxLength { break } // nothing left to beat
             }
 
-            let next = self.chain[candidate]
+            let next = self.chain[candidate & Self.chainMask]
             if next >= candidate { break }
             candidate = next
         }
@@ -600,8 +581,11 @@ struct DeflateCore: ~Copyable {
         guard self.cursor > keep * 2 else { return }
 
         // Never drop what the open block has not been written out of: if it closes as a stored
-        // block, those bytes are what it writes.
-        let drop = min(self.cursor - keep, self.blockStart)
+        // block, those bytes are what it writes. And only whole multiples of the chain ring:
+        // a position's slot is `position & chainMask`, so a rebase by anything else would move
+        // every entry to a slot nothing will ever read it from. The reference slides its
+        // window in the same fixed steps for the same reason.
+        let drop = min(self.cursor - keep, self.blockStart) & ~Self.chainMask
         guard drop > 0 else { return }
 
         self.pending.removeFirst(drop)
@@ -612,11 +596,11 @@ struct DeflateCore: ~Copyable {
             self.head[index] = self.head[index] >= drop ? self.head[index] - drop : -1
         }
 
-        // Shifted and rebased in the same forward pass: every read is `drop` ahead of its
-        // write, so the regions may overlap without a scratch copy.
-        for index in 0 ..< self.pending.count {
-            let previous = self.chain[index + drop]
-            self.chain[index] = previous >= drop ? previous - drop : -1
+        // The ring's slots stay where they are — `(position - drop) & chainMask` is not
+        // `position & chainMask`, but the slot for a position is only ever *read* through the
+        // same masked arithmetic it was written through, so only the values need rebasing.
+        for index in 0 ..< Self.chainSize {
+            self.chain[index] = self.chain[index] >= drop ? self.chain[index] - drop : -1
         }
     }
 
