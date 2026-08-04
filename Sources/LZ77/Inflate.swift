@@ -400,15 +400,39 @@ struct InflateCore: ~Copyable {
             return true
 
         case .storedCopy:
-            while self.storedRemaining > 0, !self.destinationFull {
-                guard let byte = self.reader.bits(8) else { return false }
+            // Stored data is not bit-packed, so when the reader sits on a byte boundary — which
+            // the header's alignment guarantees, unless a caller primed odd bits underneath it —
+            // the block moves as bulk copies: input to destination in one, destination into the
+            // window in another.
+            if self.reader.isByteAligned {
+                while self.storedRemaining > 0, !self.destinationFull {
+                    let want = min(
+                        self.storedRemaining,
+                        self.destinationCapacity - self.destinationCount
+                    )
+                    let got = self.reader.copyAlignedBytes(
+                        into: self.destination + self.destinationCount,
+                        count: want
+                    )
 
-                self.emit(UInt8(truncatingIfNeeded: byte))
-                self.storedRemaining -= 1
+                    guard got > 0 else { return false }
+
+                    self.syncWindow(from: self.destination + self.destinationCount, count: got)
+                    self.totalProduced &+= got
+                    self.destinationCount += got
+                    self.storedRemaining -= got
+                }
+            } else {
+                while self.storedRemaining > 0, !self.destinationFull {
+                    guard let byte = self.reader.bits(8) else { return false }
+
+                    self.emit(UInt8(truncatingIfNeeded: byte))
+                    self.storedRemaining -= 1
+                }
             }
 
             guard self.storedRemaining == 0 else {
-                // Still bytes to copy, so the loop above ended on a full destination.
+                // Still bytes to copy, so the loops above ended on a full destination.
                 return false
             }
 
