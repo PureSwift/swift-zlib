@@ -16,6 +16,15 @@
 #ifndef SWIFTZLIB_SHIM_H
 #define SWIFTZLIB_SHIM_H
 
+/* What zutil.h defines for the reference's own build, for the same reason: if the build sets
+ * _FILE_OFFSET_BITS=64 — as 32-bit targets do — zlib.h would otherwise enter Z_WANT64 mode and
+ * rename gztell to gztell64 out from under the definitions here. The library defines both names
+ * separately, so it must see both undisturbed.
+ */
+#ifndef ZLIB_INTERNAL
+#define ZLIB_INTERNAL
+#endif
+
 #ifndef _LARGEFILE64_SOURCE
 #define _LARGEFILE64_SOURCE 1
 #endif
