@@ -127,6 +127,24 @@ struct BitReader {
         return true
     }
 
+    // -- the raw fields, for the fast path -----------------------------------
+    //
+    // The fast loop in `InflateCore` runs on local copies of these and writes them back once
+    // per run, having first given back the whole bytes it over-read — so the at-most-seven-bit
+    // invariant documented on ``pulledByteCount`` holds again by the time anything outside the
+    // run can observe it.
+
+    var rawBuffer: UInt64 { self.buffer }
+    var rawBitCount: Int { self.bitCount }
+    var rawInputOffset: Int { self.inputOffset }
+    var rawInput: UnsafeBufferPointer<UInt8> { self.input }
+
+    mutating func restoreRaw(buffer: UInt64, bitCount: Int, inputOffset: Int) {
+        self.buffer = buffer
+        self.bitCount = bitCount
+        self.inputOffset = inputOffset
+    }
+
     /// Whether the reader sits on a byte boundary with nothing part-read.
     var isByteAligned: Bool {
         self.bitCount % 8 == 0
