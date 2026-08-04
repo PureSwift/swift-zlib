@@ -54,6 +54,19 @@ struct InflateCore: ~Copyable {
     private var windowPosition = 0
     private var totalProduced = 0
 
+    /// The packed decode tables the fast path indexes: the literal/length table at offset
+    /// zero, the distance table at ``DecodeTable/enoughLengths``. Rebuilt for every block that
+    /// reaches `blockData`; `packedValid` is false in the states between.
+    ///
+    /// A second representation of the same codes the `HuffmanTable`s hold, kept in parallel on
+    /// purpose: the careful path can pause mid-symbol and the packed one cannot, so each path
+    /// keeps the shape it needs and the block-header cost of building both is noise against
+    /// decoding even a small block.
+    private let packed: UnsafeMutablePointer<UInt32>
+    private var packedLiteralRoot = 0
+    private var packedDistanceRoot = 0
+    private var packedValid = false
+
     /// Whether the current block is the stream's last, read from its header and acted on once
     /// its end-of-block symbol is reached.
     private var isFinalBlock = false
@@ -99,10 +112,15 @@ struct InflateCore: ~Copyable {
     init() {
         self.window = .allocate(capacity: DeflateTables.windowSize)
         self.window.initialize(repeating: 0, count: DeflateTables.windowSize)
+
+        let packedCapacity = DecodeTable.enoughLengths + DecodeTable.enoughDistances
+        self.packed = .allocate(capacity: packedCapacity)
+        self.packed.initialize(repeating: 0, count: packedCapacity)
     }
 
     deinit {
         self.window.deallocate()
+        self.packed.deallocate()
     }
 
     var needsInput: Bool {
@@ -226,6 +244,13 @@ struct InflateCore: ~Copyable {
         // Copied rather than shared: the whole point of a copy is that writing through one
         // handle cannot be seen through the other.
         clone.window.update(from: self.window, count: DeflateTables.windowSize)
+        clone.packed.update(
+            from: self.packed,
+            count: DecodeTable.enoughLengths + DecodeTable.enoughDistances
+        )
+        clone.packedLiteralRoot = self.packedLiteralRoot
+        clone.packedDistanceRoot = self.packedDistanceRoot
+        clone.packedValid = self.packedValid
         clone.windowPosition = self.windowPosition
         clone.totalProduced = self.totalProduced
         clone.isFinalBlock = self.isFinalBlock
@@ -344,6 +369,10 @@ struct InflateCore: ~Copyable {
             case 1:
                 self.literalTable = try HuffmanTable(lengths: DeflateTables.fixedLiteralLengths)
                 self.distanceTable = try HuffmanTable(lengths: DeflateTables.fixedDistanceLengths)
+                self.buildPackedTables(
+                    literalLengths: DeflateTables.fixedLiteralLengths,
+                    distanceLengths: DeflateTables.fixedDistanceLengths
+                )
                 self.symbolPartial = HuffmanTable.Partial()
                 self.state = .blockData
 
@@ -455,13 +484,20 @@ struct InflateCore: ~Copyable {
 
             // These two alphabets may be §3.2.7's permitted single one-bit code; the
             // code-length alphabet built above may not, and is checked without the exemption.
+            let literalLengths = Array(self.combinedLengths[0 ..< self.literalCount])
+            let distanceLengths = Array(self.combinedLengths[self.literalCount...])
+
             self.literalTable = try HuffmanTable(
-                lengths: Array(self.combinedLengths[0 ..< self.literalCount]),
+                lengths: literalLengths,
                 allowingIncomplete: true
             )
             self.distanceTable = try HuffmanTable(
-                lengths: Array(self.combinedLengths[self.literalCount...]),
+                lengths: distanceLengths,
                 allowingIncomplete: true
+            )
+            self.buildPackedTables(
+                literalLengths: literalLengths,
+                distanceLengths: distanceLengths
             )
             self.symbolPartial = HuffmanTable.Partial()
             self.state = .blockData
@@ -491,6 +527,26 @@ struct InflateCore: ~Copyable {
         case .blockData:
             guard let table = self.literalTable else {
                 throw DeflateError("internal: no literal table")
+            }
+
+            // The fast path handles whole symbols only, so anything held over from a previous
+            // call — a parked literal, a part-read code — is settled by the careful loop below
+            // before it can run. It pauses only at symbol boundaries, which is exactly where
+            // the careful loop knows how to continue.
+            if self.packedValid, self.heldLiteral == nil, self.symbolPartial.length == 0 {
+                switch self.inflateFast() {
+                case .endOfBlock:
+                    self.endBlock()
+                    return true
+                case .invalidLengthSymbol:
+                    throw DeflateError("invalid length symbol")
+                case .invalidDistanceSymbol:
+                    throw DeflateError("invalid distance symbol")
+                case .distanceTooFar:
+                    throw DeflateError("match distance reaches before the start of the stream")
+                case .paused:
+                    break
+                }
             }
 
             while true {
@@ -630,6 +686,272 @@ struct InflateCore: ~Copyable {
         case .done:
             return false
         }
+    }
+
+    // -- the fast path ----------------------------------------------------------
+
+    private mutating func buildPackedTables(literalLengths: [UInt8], distanceLengths: [UInt8]) {
+        let literal = DecodeTable.build(
+            .literals,
+            lengths: literalLengths,
+            into: self.packed,
+            capacity: DecodeTable.enoughLengths
+        )
+        let distance = DecodeTable.build(
+            .distances,
+            lengths: distanceLengths,
+            into: self.packed + DecodeTable.enoughLengths,
+            capacity: DecodeTable.enoughDistances
+        )
+
+        if let literal, let distance {
+            self.packedLiteralRoot = literal.rootBits
+            self.packedDistanceRoot = distance.rootBits
+            self.packedValid = true
+        } else {
+            // Cannot happen for lengths the HuffmanTable initializers accepted; if it somehow
+            // does, the careful path decodes the block alone and correctness is untouched.
+            self.packedValid = false
+        }
+    }
+
+    /// Folds bytes the fast loop wrote to the destination into the circular window, in at most
+    /// two copies — the bulk replacement for the byte-at-a-time bookkeeping `emit` does.
+    ///
+    /// Only the last window's worth of `count` matters; anything older is unreachable by any
+    /// distance and is skipped rather than copied.
+    private mutating func syncWindow(from source: UnsafePointer<UInt8>, count: Int) {
+        let size = DeflateTables.windowSize
+        let mask = DeflateTables.windowMask
+
+        let effective = min(count, size)
+        let skipped = count - effective
+        var position = (self.windowPosition &+ skipped) & mask
+        var copied = 0
+
+        while copied < effective {
+            let run = min(effective - copied, size - position)
+            (self.window + position).update(from: source + skipped + copied, count: run)
+            position = (position &+ run) & mask
+            copied += run
+        }
+
+        self.windowPosition = (self.windowPosition &+ count) & mask
+    }
+
+    private enum FastOutcome {
+        case paused
+        case endOfBlock
+        case invalidLengthSymbol
+        case invalidDistanceSymbol
+        case distanceTooFar
+    }
+
+    /// The reference's `inflate_fast`, in this decoder's terms: while there is enough input
+    /// that an eight-byte load cannot run off the end, and enough output room that a maximal
+    /// match cannot either, decode whole symbols against the packed tables with every check
+    /// hoisted out of the loop.
+    ///
+    /// Runs on locals and reconciles once, on any exit: whole bytes over-read are handed back
+    /// to the reader — restoring the at-most-seven-bit invariant `pulledInputCount` documents —
+    /// and everything produced is folded into the window in one bulk copy. Within the run, the
+    /// caller's own buffer serves as the history for any match that reaches only into this
+    /// call's output, which is most of them; the window is read only for distances reaching
+    /// back past the call boundary.
+    ///
+    /// Never entered mid-symbol and never exits mid-symbol, which is what lets it coexist with
+    /// the careful path's resumability: pausing here means "at a symbol boundary, out of
+    /// slack", and the careful loop picks up from exactly that boundary.
+    private mutating func inflateFast() -> FastOutcome {
+        let input = self.reader.rawInput
+        guard let inBase = input.baseAddress else { return .paused }
+
+        // 48 bits covers the longest symbol pair (15 + 5 + 15 + 13), so one refill per
+        // iteration is enough; 272 of output slack covers a maximal match of 258 plus a wide
+        // copy's overshoot.
+        let inLimit = input.count - 7
+        let outLimit = self.destinationCapacity - 272
+
+        var inOffset = self.reader.rawInputOffset
+        var hold = self.reader.rawBuffer
+        var bits = self.reader.rawBitCount
+        var produced = self.destinationCount
+
+        guard inOffset < inLimit, produced < outLimit else { return .paused }
+
+        let out = self.destination
+        let window = self.window
+        let mask = DeflateTables.windowMask
+        let literalTable = self.packed
+        let distanceTable = self.packed + DecodeTable.enoughLengths
+        let literalMask = UInt64((1 << self.packedLiteralRoot) - 1)
+        let distanceMask = UInt64((1 << self.packedDistanceRoot) - 1)
+
+        let runStart = produced
+
+        // History that exists before this call's first byte: what a distance may reach beyond
+        // this call's own output. `totalProduced` already counts this call's earlier bytes, so
+        // they are subtracted back out here and re-added as `produced` in the check.
+        let historyBeforeCall = self.totalProduced - runStart
+
+        var outcome = FastOutcome.paused
+
+        run: while true {
+            if bits < 48 {
+                let raw = UnsafeRawPointer(inBase + inOffset).loadUnaligned(as: UInt64.self)
+                hold |= UInt64(littleEndian: raw) << UInt64(bits)
+                inOffset &+= (63 - bits) >> 3
+                bits |= 56
+            }
+
+            var entry = literalTable[Int(hold & literalMask)]
+            var op = Int((entry >> 8) & 0xFF)
+
+            symbol: while true {
+                let took = Int(entry & 0xFF)
+                hold >>= UInt64(took)
+                bits &-= took
+
+                if op == 0 {
+                    out[produced] = UInt8(truncatingIfNeeded: entry >> 16)
+                    produced &+= 1
+                    break symbol
+                }
+
+                if op & 16 != 0 {
+                    var length = Int(entry >> 16)
+                    let lengthExtra = op & 15
+                    if lengthExtra > 0 {
+                        length &+= Int(hold & ((1 << UInt64(lengthExtra)) - 1))
+                        hold >>= UInt64(lengthExtra)
+                        bits &-= lengthExtra
+                    }
+
+                    entry = distanceTable[Int(hold & distanceMask)]
+                    op = Int((entry >> 8) & 0xFF)
+
+                    distance: while true {
+                        let took = Int(entry & 0xFF)
+                        hold >>= UInt64(took)
+                        bits &-= took
+
+                        if op & 16 != 0 {
+                            var dist = Int(entry >> 16)
+                            let distExtra = op & 15
+                            if distExtra > 0 {
+                                dist &+= Int(hold & ((1 << UInt64(distExtra)) - 1))
+                                hold >>= UInt64(distExtra)
+                                bits &-= distExtra
+                            }
+
+                            guard dist <= historyBeforeCall &+ produced,
+                                  dist <= DeflateTables.windowSize
+                            else {
+                                outcome = .distanceTooFar
+                                break run
+                            }
+
+                            if dist <= produced {
+                                // The whole match lies inside this call's own output, which is
+                                // contiguous — no window, no masking. Eight bytes at a time is
+                                // safe whenever the source runs at least eight bytes behind
+                                // the destination: every load reads bytes already final.
+                                let src = out + (produced - dist)
+                                let dst = out + produced
+
+                                if dist >= 8 {
+                                    var index = 0
+                                    while index < length {
+                                        let chunk = UnsafeRawPointer(src + index)
+                                            .loadUnaligned(as: UInt64.self)
+                                        UnsafeMutableRawPointer(dst + index)
+                                            .storeBytes(of: chunk, as: UInt64.self)
+                                        index &+= 8
+                                    }
+                                } else if dist == 1 {
+                                    dst.update(repeating: src.pointee, count: length)
+                                } else {
+                                    for index in 0 ..< length {
+                                        dst[index] = src[index]
+                                    }
+                                }
+                                produced &+= length
+                            } else {
+                                // The head of the match reaches past this call's output into
+                                // the window; the tail, if any, continues from the output.
+                                var fromWindow = dist - produced
+                                var remaining = length
+                                var readPosition = (self.windowPosition &- runStart &- fromWindow) & mask
+
+                                while fromWindow > 0, remaining > 0 {
+                                    out[produced] = window[readPosition]
+                                    readPosition = (readPosition &+ 1) & mask
+                                    produced &+= 1
+                                    fromWindow &-= 1
+                                    remaining &-= 1
+                                }
+
+                                let src = out + (produced - dist)
+                                for index in 0 ..< remaining {
+                                    out[produced &+ index] = src[index]
+                                }
+                                produced &+= remaining
+                            }
+
+                            break symbol
+                        }
+
+                        if op & 64 == 0 {
+                            let link = Int(entry >> 16) &+ Int(hold & ((1 << UInt64(op)) - 1))
+                            entry = distanceTable[link]
+                            op = Int((entry >> 8) & 0xFF)
+                            continue distance
+                        }
+
+                        outcome = .invalidDistanceSymbol
+                        break run
+                    }
+                }
+
+                if op & 64 == 0 {
+                    let link = Int(entry >> 16) &+ Int(hold & ((1 << UInt64(op)) - 1))
+                    entry = literalTable[link]
+                    op = Int((entry >> 8) & 0xFF)
+                    continue symbol
+                }
+
+                if op & 32 != 0 {
+                    outcome = .endOfBlock
+                    break run
+                }
+
+                outcome = .invalidLengthSymbol
+                break run
+            }
+
+            if inOffset >= inLimit || produced >= outLimit {
+                break run
+            }
+        }
+
+        // Hand back the whole bytes the wide refills over-read, which is what keeps
+        // `pulledInputCount` exact: at most seven bits stay buffered, less than a byte, the
+        // same invariant the careful reader maintains.
+        let giveBack = bits >> 3
+        inOffset &-= giveBack
+        bits &= 7
+        hold &= (UInt64(1) << UInt64(bits)) - 1
+
+        self.reader.restoreRaw(buffer: hold, bitCount: bits, inputOffset: inOffset)
+
+        let producedInRun = produced - runStart
+        if producedInRun > 0 {
+            self.syncWindow(from: out + runStart, count: producedInRun)
+            self.totalProduced &+= producedInRun
+        }
+        self.destinationCount = produced
+
+        return outcome
     }
 
     /// Ends the block just completed, and the stream with it if that block declared itself last.
