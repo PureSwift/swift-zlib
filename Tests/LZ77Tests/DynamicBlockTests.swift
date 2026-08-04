@@ -30,13 +30,15 @@ struct DynamicBlockTests {
             var frequencies = [Int](repeating: 0, count: 286)
 
             // A mix of shapes: a few symbols, many symbols, and steeply skewed weights, which is
-            // what drives an unconstrained tree past fifteen levels.
+            // what drives an unconstrained tree past fifteen levels. The steep weights must
+            // still sum inside Int on a 32-bit platform: up to 286 draws of 2^shift each.
             let used = 1 + Int(generator.next() % 286)
+            let steepestShift: UInt64 = Int.bitWidth == 64 ? 40 : 20
 
             for _ in 0 ..< used {
                 let symbol = Int(generator.next() % 286)
                 let weight = trial % 3 == 0
-                    ? 1 << (generator.next() % 40) // steep, to force deep codes
+                    ? 1 << (generator.next() % steepestShift) // steep, to force deep codes
                     : 1 + generator.next() % 1000
 
                 frequencies[symbol] += Int(weight)
