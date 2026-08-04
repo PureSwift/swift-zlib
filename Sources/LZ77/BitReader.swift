@@ -127,6 +127,31 @@ struct BitReader {
         return true
     }
 
+    /// Copies up to `count` whole bytes into `destination` — the stored-block path, where the
+    /// data is not bit-packed at all and reading it eight bits at a time would be pure
+    /// ceremony. Whole bytes already in the bit buffer come first (the reader is byte-aligned
+    /// in a stored block, so there are no part-bytes to worry about), then the rest straight
+    /// out of the input in one copy. Returns how many bytes were delivered.
+    mutating func copyAlignedBytes(into destination: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
+        var copied = 0
+
+        while copied < count, self.bitCount >= 8 {
+            destination[copied] = UInt8(truncatingIfNeeded: self.buffer)
+            self.buffer >>= 8
+            self.bitCount -= 8
+            copied += 1
+        }
+
+        let take = min(count - copied, self.input.count - self.inputOffset)
+        if take > 0, let base = self.input.baseAddress {
+            (destination + copied).update(from: base + self.inputOffset, count: take)
+            self.inputOffset += take
+            copied += take
+        }
+
+        return copied
+    }
+
     // -- the raw fields, for the fast path -----------------------------------
     //
     // The fast loop in `InflateCore` runs on local copies of these and writes them back once
