@@ -29,13 +29,29 @@ struct BitWriter {
         }
     }
 
-    /// Writes a Huffman code, reversing it so the most significant bit goes out first.
-    mutating func writeCode(_ code: UInt32, bits: Int) {
-        var reversed: UInt32 = 0
+    /// Each byte backwards, for building the code reversals below out of two lookups.
+    private static let reversedByte: [UInt8] = {
+        var table = [UInt8](repeating: 0, count: 256)
 
-        for index in 0 ..< bits {
-            reversed |= ((code >> (bits - 1 - index)) & 1) << index
+        for value in 0 ..< 256 {
+            var reversed = 0
+            for bit in 0 ..< 8 where value & (1 << bit) != 0 {
+                reversed |= 1 << (7 - bit)
+            }
+            table[value] = UInt8(reversed)
         }
+
+        return table
+    }()
+
+    /// Writes a Huffman code, reversing it so the most significant bit goes out first.
+    ///
+    /// The reversal is a sixteen-bit byte-table reversal shifted down to `bits`, run once per
+    /// symbol written — which is why it is two lookups rather than a loop over the bits.
+    mutating func writeCode(_ code: UInt32, bits: Int) {
+        let low = Self.reversedByte[Int(code & 0xFF)]
+        let high = Self.reversedByte[Int((code >> 8) & 0xFF)]
+        let reversed = (UInt32(low) << 8 | UInt32(high)) >> (16 - bits)
 
         self.write(reversed, bits: bits)
     }
