@@ -70,14 +70,21 @@ same level, and on **Silesia** (212 MB) **0.26% smaller** — every file within 
 way, and every file verified in both directions: compressed here and read by the reference, and
 compressed by the reference and read here. `./scripts/check_corpus.sh <directory>` repeats it.
 
-It is **slower**, and that is the honest trade: decompression runs at a quarter to a fifth of
-the reference's speed and compression a third to a fifth. The reference has had twenty-five
-years of tuning by people who cared about exactly this. Half of the original gap turned out to
-be Swift's dynamic exclusivity checking — every mutating access to a struct stored in a class
-is checked at runtime, once per decoded symbol — and was removed *without* unsafe flags by
-moving each stream's state into a `~Copyable` struct core, where the same mutation through
-`inout self` is checked at compile time. The remaining gap is structural: zlib's decoder
-resolves several bytes per iteration where this one resolves one.
+Speed is now **at or near the reference's**, and got there in three visible stages, each
+measured by `./scripts/run_benchmark.sh`. First, Swift's dynamic exclusivity checking — every
+mutating access to a struct stored in a class is checked at runtime, once per decoded symbol —
+was removed *without* unsafe flags by moving each stream's state into a `~Copyable` struct
+core, where the same mutation through `inout self` is checked at compile time. Second, the
+decoder gained the reference's own architecture: packed two-level tables that answer a whole
+symbol in one load, a speculative fast loop that refills 56 bits at a time and reconciles the
+exact byte position once per run, matches copied eight bytes at a stride, and stored blocks
+moved as bulk copies. Third, the encoder's hash chains moved into a fixed ring the cache can
+hold, candidates are measured eight bytes per step, and the reference's search economies —
+quarter budget while holding a good match, no search past `max_lazy`, no hashing inside long
+runs at the greedy levels — were adopted whole. Decompression of zlib-framed data now runs
+*faster* than the reference on text and within 10–20% on binary and incompressible data;
+compression sits between half and parity depending on level and payload. What remains is
+profile-guided work, not architecture.
 
 The streaming types also carry a span-shaped API alongside the pointer one: input arrives as a
 borrowed `Span` that cannot be stored, output goes through `OutputSpan`, and what a call did
