@@ -19,6 +19,8 @@
 
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Android)
+import Android
 #elseif canImport(Darwin)
 import Darwin
 #endif
@@ -157,7 +159,7 @@ private func open(_ path: UnsafePointer<CChar>?, _ mode: UnsafePointer<CChar>?) 
         if parsed.exclusive { flags |= O_EXCL }
     }
 
-    let descriptor = Glibc.open(path, flags, 0o666)
+    let descriptor = systemOpen(path, flags, 0o666)
     guard descriptor >= 0 else { return nil }
 
     return attachFile(descriptor, parsed)
