@@ -117,8 +117,11 @@ struct DeflateCore: ~Copyable {
     /// with its length in bits 0...8 and its distance in bits 9...24.
     ///
     /// Packed into a word rather than an enum because there is one of these per literal byte,
-    /// and the array is the encoder's largest allocation.
-    private var symbols: [UInt32] = []
+    /// and raw fixed-capacity memory rather than an array because one is appended per literal
+    /// byte too: the capacity is `maxBlockSymbols` by construction — `blockIsFull` closes the
+    /// block before another append — so the append is a store and an increment, nothing else.
+    private var symbols: UnsafeMutablePointer<UInt32>
+    private var symbolCount = 0
 
     /// Where in `pending` the open block's uncompressed bytes start, which is what a stored
     /// block writes out and therefore what cannot be trimmed away while the block is open.
@@ -186,13 +189,14 @@ struct DeflateCore: ~Copyable {
         self.head.initialize(repeating: -1, count: Self.hashSize)
         self.chain = .allocate(capacity: Self.chainSize)
         self.chain.initialize(repeating: -1, count: Self.chainSize)
+        self.symbols = .allocate(capacity: Self.maxBlockSymbols + 8)
         self.windowSize = 1 << max(9, min(15, Int(windowBits)))
-        self.symbols.reserveCapacity(Self.maxBlockSymbols)
     }
 
     deinit {
         self.head.deallocate()
         self.chain.deallocate()
+        self.symbols.deallocate()
     }
 
     // -- what a caller can change or carry over ------------------------------------
@@ -289,7 +293,8 @@ struct DeflateCore: ~Copyable {
         clone.chain.update(from: self.chain, count: Self.chainSize)
 
         clone.writer = self.writer
-        clone.symbols = self.symbols
+        clone.symbols.update(from: self.symbols, count: self.symbolCount)
+        clone.symbolCount = self.symbolCount
         clone.blockStart = self.blockStart
         clone.deferred = self.deferred
         clone.literalFrequencies = self.literalFrequencies
@@ -608,7 +613,7 @@ struct DeflateCore: ~Copyable {
 
     private var blockIsFull: Bool {
         self.emittedEnd - self.blockStart >= Self.maxBlockBytes
-            || self.symbols.count >= Self.maxBlockSymbols
+            || self.symbolCount >= Self.maxBlockSymbols
     }
 
     /// Drops history no match can reach any more, so `pending` does not grow with the stream.
@@ -643,14 +648,14 @@ struct DeflateCore: ~Copyable {
     // -- collecting a block's symbols --------------------------------------------
 
     private mutating func appendLiteral(_ byte: UInt8) {
-        self.symbols.append(UInt32(byte))
+        self.symbols[self.symbolCount] = UInt32(byte)
+        self.symbolCount += 1
         self.literalFrequencies[Int(byte)] += 1
     }
 
     private mutating func appendMatch(length: Int, distance: Int) {
-        self.symbols.append(
-            0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
-        )
+        self.symbols[self.symbolCount] = 0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
+        self.symbolCount += 1
 
         let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
         let distanceSymbol = Self.distanceSymbol(for: distance)
@@ -724,7 +729,7 @@ struct DeflateCore: ~Copyable {
             self.writer.alignToByte()
         }
 
-        self.symbols.removeAll(keepingCapacity: true)
+        self.symbolCount = 0
         self.extraBits = 0
         self.blockStart = blockEnd
 
@@ -799,7 +804,8 @@ struct DeflateCore: ~Copyable {
         self.writer.write(final ? 1 : 0, bits: 1)
         self.writer.write(1, bits: 2)
 
-        for symbol in self.symbols {
+        for index in 0 ..< self.symbolCount {
+            let symbol = self.symbols[index]
             guard symbol & 0x8000_0000 != 0 else {
                 self.writeLiteralOrLength(UInt16(truncatingIfNeeded: symbol))
                 continue
@@ -820,7 +826,8 @@ struct DeflateCore: ~Copyable {
 
         table.writeTable(to: &self.writer)
 
-        for symbol in self.symbols {
+        for index in 0 ..< self.symbolCount {
+            let symbol = self.symbols[index]
             guard symbol & 0x8000_0000 != 0 else {
                 let literal = Int(symbol & 0xFF)
                 self.writer.writeCode(
