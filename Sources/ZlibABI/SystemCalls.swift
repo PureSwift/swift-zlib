@@ -10,6 +10,8 @@
 import Glibc
 #elseif canImport(Android)
 import Android
+#elseif canImport(Musl)
+import Musl
 #elseif canImport(Darwin)
 import Darwin
 #endif
@@ -32,4 +34,12 @@ func systemWrite(_ descriptor: Int32, _ bytes: UnsafeRawPointer, _ count: Int) -
 @inline(__always)
 func systemClose(_ descriptor: Int32) -> Int32 {
     close(descriptor)
+}
+
+// `off_t` is `Int` under Glibc and `Int64` under Bionic, Musl and Darwin — same width, spelled
+// through a different C type. The conversion happens here so the file layer's own arithmetic
+// stays in `Int`.
+@inline(__always)
+func systemSeek(_ descriptor: Int32, _ offset: Int, _ whence: Int32) -> Int {
+    Int(lseek(descriptor, off_t(offset), whence))
 }
