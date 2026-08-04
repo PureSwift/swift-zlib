@@ -34,11 +34,13 @@ jobs:
       - run: swift test
 
   # musl instead of Glibc — the libc of Alpine and of Swift's fully static Linux binaries,
-  # and a different Swift platform module, so nothing short of building against it proves
-  # the platform seams are right. The build is statically linked, so the host can run the
-  # test suite for real despite being a Glibc system.
+  # and a different Swift platform module, so nothing short of building against it proves the
+  # platform seams are right. Build-only, in two senses: the static SDK ships no testing
+  # library to link a test product against, and its runtime archives are not built for
+  # linking into a shared library — so this builds every module through the C boundary and
+  # stops short of the one product the SDK cannot express.
   musl:
-    name: Build and test (musl, static)
+    name: Build (musl, static)
     runs-on: ubuntu-latest
     # Pinned to the SDK's exact toolchain, not a floating tag: a Swift SDK's modules are only
     # importable by the compiler version that built them.
@@ -50,10 +52,8 @@ jobs:
           swift sdk install
           "https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz"
           --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
-      - name: Build the package and its tests
-        run: swift build --build-tests --swift-sdk x86_64-swift-linux-musl
-      - name: Test
-        run: .build/x86_64-swift-linux-musl/debug/swift-zlibPackageTests.xctest --testing-library swift-testing
+      - name: Build every module, through the C boundary
+        run: swift build --swift-sdk x86_64-swift-linux-musl --target ZlibABI
 
   conformance:
     name: Conformance against the system libz
@@ -62,8 +62,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The reference to compare against, and the tools the checks are built with.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build gcc zlib1g-dev python3
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build gcc make python3
+
+      # The reference to compare against, pinned by building it rather than taking whatever
+      # the distribution carries — noble's zlib is 1.3, and the first compared line is the
+      # version string. The distribution's zlib1g-dev is deliberately not installed, so there
+      # is only one zlib.h and one -lz to find.
+      - name: Build the reference zlib 1.3.1
+        run: |
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib
+          cd /tmp/zlib
+          ./configure
+          make -j"$(nproc)"
+          make install
+          ldconfig
+
       - run: cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/cmake
 
@@ -75,9 +88,9 @@ jobs:
       - run: ./scripts/run_conformance.sh build/cmake/libz.so.1.3.1
 
       # zlib's own test programs, built against this library unmodified.
+      # zlib's own test programs, from the clone the reference was built from.
       - name: zlib's own test suite
         run: |
-          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib
           cc -O1 -I Sources/CZlib/include -o /tmp/example \
             /tmp/zlib/test/example.c build/cmake/libz.so.1.3.1 \
             -Wl,-rpath,"$PWD/build/cmake"
