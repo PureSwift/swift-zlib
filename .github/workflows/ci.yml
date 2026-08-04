@@ -14,14 +14,46 @@ on:
   workflow_dispatch:
 
 jobs:
+  # arm64 runs on a real hosted ARM64 machine, not a cross-compilation target: the tests
+  # execute, which matters for an engine full of width-sensitive bit arithmetic.
   test:
-    name: Build and test
-    runs-on: ubuntu-latest
+    name: Build and test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: swift:6.3-noble
     steps:
       - uses: actions/checkout@v4
       - run: swift build
       - run: swift test
+
+  # musl instead of Glibc — the libc of Alpine and of Swift's fully static Linux binaries,
+  # and a different Swift platform module, so nothing short of building against it proves
+  # the platform seams are right. The build is statically linked, so the host can run the
+  # test suite for real despite being a Glibc system.
+  musl:
+    name: Build and test (musl, static)
+    runs-on: ubuntu-latest
+    # Pinned to the SDK's exact toolchain, not a floating tag: a Swift SDK's modules are only
+    # importable by the compiler version that built them.
+    container: swift:6.3.3-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the static Linux SDK
+        run: >
+          swift sdk install
+          "https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz"
+          --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+      - name: Build the package and its tests
+        run: swift build --build-tests --swift-sdk x86_64-swift-linux-musl
+      - name: Test
+        run: .build/x86_64-swift-linux-musl/debug/swift-zlibPackageTests.xctest --testing-library swift-testing
 
   conformance:
     name: Conformance against the system libz
@@ -31,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # The reference to compare against, and the tools the checks are built with.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build zlib1g-dev python3
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build gcc zlib1g-dev python3
       - run: cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/cmake
 
