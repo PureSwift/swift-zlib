@@ -1,17 +1,16 @@
-# Everything this project claims is checked by a script; this is what runs them.
+# The Linux claims: the export list has to match the reference symbol for symbol, and the
+# behaviour has to match it call for call. Both are easy to break from an ordinary desktop
+# build without noticing, which is the whole reason they are scripts rather than paragraphs.
 #
-# The claims are not the kind that stay true on their own. The export list has to match the
-# reference symbol for symbol, the behaviour has to match it call for call, and the engine has
-# to keep building for a target with no operating system — and all three are easy to break from
-# an ordinary desktop build without noticing, which is the whole reason they are scripts rather
-# than paragraphs.
+# This workflow is Linux only because the conformance is: the reference to compare against
+# lives here, and so does the installable libz.so.1. The other platforms the engine builds
+# for each have a workflow of their own — macos.yml, windows.yml, android.yml — and the
+# no-operating-system configuration has embedded.yml.
 
 name: CI
 
 on:
   push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -61,14 +60,3 @@ jobs:
           gzip -dc /tmp/ours.gz | cmp - /tmp/payload
           gzip -c /tmp/payload > /tmp/theirs.gz
           /tmp/minigzip -d < /tmp/theirs.gz | cmp - /tmp/payload
-
-  embedded:
-    name: Embedded Swift
-    runs-on: ubuntu-latest
-    container: swift:6.3-noble
-    steps:
-      - uses: actions/checkout@v4
-      # A round trip under Embedded Swift on the host, then compilation for three bare-metal
-      # targets. One existential in an error path is enough to break this, and nothing else
-      # in this workflow would notice.
-      - run: ./scripts/check_embedded.sh
