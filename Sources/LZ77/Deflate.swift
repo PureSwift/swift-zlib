@@ -33,23 +33,39 @@ struct DeflateCore: ~Copyable {
         let goodMatch: Int
         let maxLazy: Int
 
+        /// The reference's `good_length` column: while a match at least this long is already
+        /// in hand, the search for a better one runs on a quarter of the chain budget —
+        /// beating a good match is unlikely, so little is spent trying. Zero means never.
+        let quarterAt: Int
+
+        /// The reference's insertion cap for its greedy levels: a match longer than this has
+        /// its covered positions left out of the hash table entirely. At levels that take
+        /// every match as found, hashing the inside of a long run costs real time and buys
+        /// almost nothing — the run's own head is already indexed. The lazy levels index
+        /// everything, as the reference does.
+        let maxInsert: Int
+
         /// `maxLazy` of zero means take every match as it is found, without looking a byte
         /// further — which is what the reference does for its fast levels, and what the levels
         /// below four ask for by asking to be fast. Deferring doubles the number of searches,
         /// and on data whose matches cluster around the threshold it can cost a little size as
         /// well: it is a heuristic, not a strict improvement.
+        ///
+        /// The columns are the reference's own configuration_table, in its terms:
+        /// (max_chain, nice_length, max_lazy, good_length) — with `maxInsert` standing in for
+        /// what its greedy levels do with max_insert_length.
         static func forLevel(_ level: Int32) -> Effort {
             switch level {
-            case ..<1: return Effort(maxChainLength: 0, goodMatch: 0, maxLazy: 0)
-            case 1: return Effort(maxChainLength: 4, goodMatch: 8, maxLazy: 0)
-            case 2: return Effort(maxChainLength: 8, goodMatch: 16, maxLazy: 0)
-            case 3: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 0)
-            case 4: return Effort(maxChainLength: 16, goodMatch: 16, maxLazy: 4)
-            case 5: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 16)
-            case 6: return Effort(maxChainLength: 128, goodMatch: 128, maxLazy: 16)
-            case 7: return Effort(maxChainLength: 256, goodMatch: 128, maxLazy: 32)
-            case 8: return Effort(maxChainLength: 1024, goodMatch: 258, maxLazy: 128)
-            default: return Effort(maxChainLength: 4096, goodMatch: 258, maxLazy: 258)
+            case ..<1: return Effort(maxChainLength: 0, goodMatch: 0, maxLazy: 0, quarterAt: 0, maxInsert: 0)
+            case 1: return Effort(maxChainLength: 4, goodMatch: 8, maxLazy: 0, quarterAt: 0, maxInsert: 4)
+            case 2: return Effort(maxChainLength: 8, goodMatch: 16, maxLazy: 0, quarterAt: 0, maxInsert: 5)
+            case 3: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 0, quarterAt: 0, maxInsert: 6)
+            case 4: return Effort(maxChainLength: 16, goodMatch: 16, maxLazy: 4, quarterAt: 4, maxInsert: .max)
+            case 5: return Effort(maxChainLength: 32, goodMatch: 32, maxLazy: 16, quarterAt: 8, maxInsert: .max)
+            case 6: return Effort(maxChainLength: 128, goodMatch: 128, maxLazy: 16, quarterAt: 8, maxInsert: .max)
+            case 7: return Effort(maxChainLength: 256, goodMatch: 128, maxLazy: 32, quarterAt: 8, maxInsert: .max)
+            case 8: return Effort(maxChainLength: 1024, goodMatch: 258, maxLazy: 128, quarterAt: 32, maxInsert: .max)
+            default: return Effort(maxChainLength: 4096, goodMatch: 258, maxLazy: 258, quarterAt: 32, maxInsert: .max)
             }
         }
     }
@@ -195,7 +211,9 @@ struct DeflateCore: ~Copyable {
         self.effort = Effort(
             maxChainLength: max(0, maxChainLength),
             goodMatch: max(0, goodMatch),
-            maxLazy: max(0, maxLazy)
+            maxLazy: max(0, maxLazy),
+            quarterAt: max(0, goodMatch),
+            maxInsert: .max
         )
     }
 
@@ -401,7 +419,8 @@ struct DeflateCore: ~Copyable {
     private func longestMatch(
         _ bytes: UnsafePointer<UInt8>,
         at position: Int,
-        limit: Int
+        limit: Int,
+        holding: Int = 0
     ) -> (length: Int, distance: Int)? {
         guard position + Self.minMatch <= limit else { return nil }
 
@@ -412,6 +431,12 @@ struct DeflateCore: ~Copyable {
 
         var candidate = self.head[self.hash(bytes, at: position)]
         var chainLeft = self.effort.maxChainLength
+
+        // A quarter of the budget while a good match is already held: beating it is unlikely,
+        // so little is spent trying. The reference's `good_length`, doing exactly this.
+        if self.effort.quarterAt > 0, holding >= self.effort.quarterAt {
+            chainLeft >>= 2
+        }
         var best = 0
         var bestDistance = 0
 
@@ -501,7 +526,16 @@ struct DeflateCore: ~Copyable {
             }
 
             while self.cursor + keepBack < limit {
-                let current = self.longestMatch(bytes, at: self.cursor, limit: limit)
+                let heldLength = self.deferred?.length ?? 0
+
+                // The reference's economy, adopted whole: while a match at least `maxLazy`
+                // long is already in hand, no better one is even looked for — the search
+                // would usually lose, and it is the single most expensive thing here.
+                let current: (length: Int, distance: Int)? =
+                    heldLength > 0 && heldLength >= self.effort.maxLazy
+                    ? nil
+                    : self.longestMatch(bytes, at: self.cursor, limit: limit, holding: heldLength)
+
                 self.insert(bytes, at: self.cursor, limit: limit)
 
                 if let held = self.deferred {
@@ -545,10 +579,12 @@ struct DeflateCore: ~Copyable {
         self.appendMatch(length: match.length, distance: match.distance)
 
         // `start` and `cursor` are already in the chain — every position passes through the top
-        // of the loop above — so only what the match covers beyond them is left to insert.
+        // of the loop above — so only what the match covers beyond them is left to insert. At
+        // the greedy levels a long match's insides are not indexed at all, as the reference
+        // has it: the run's head already is, and hashing the rest costs more than it finds.
         let end = start + match.length
 
-        if end > self.cursor + 1 {
+        if end > self.cursor + 1, match.length <= self.effort.maxInsert {
             for position in (self.cursor + 1) ..< end {
                 self.insert(bytes, at: position, limit: limit)
             }
