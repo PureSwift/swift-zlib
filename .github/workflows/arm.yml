@@ -1,0 +1,30 @@
+name: ARM
+on: [push]
+jobs:
+
+  armv7-qemu:
+    name: armv7 (Debian Bookworm, QEMU)
+    runs-on: ubuntu-latest
+    container: swift:6.3.2-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install QEMU
+        run: |
+          apt-get update -q
+          apt-get install -q -y qemu-user curl
+      - name: Install armv7 cross SDK
+        run: |
+          curl -fsSL -o /tmp/armv7-sdk.tar.gz \
+            https://github.com/xtremekforever/swift-armv7/releases/download/6.3.2/swift-6.3.2-RELEASE-debian-bookworm-armv7-sdk.tar.gz
+          echo "35e0a28c04f5f5d44a33f8d201613935bb85d0b29f38f833c04b18fbe59c374a  /tmp/armv7-sdk.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/armv7-sdk.tar.gz -C /opt
+      - name: Cross-build package and tests
+        run: swift build --build-tests --destination /opt/swift-6.3.2-RELEASE-debian-bookworm-armv7/debian-bookworm.json
+      - name: Run tests under QEMU
+        run: |
+          SYSROOT=/opt/swift-6.3.2-RELEASE-debian-bookworm-armv7/debian-bookworm
+          qemu-arm -L "$SYSROOT" \
+            -E LD_LIBRARY_PATH="$SYSROOT/usr/lib/swift/linux:.build/armv7-unknown-linux-gnueabihf/debug" \
+            .build/armv7-unknown-linux-gnueabihf/debug/swift-zlibPackageTests.xctest \
+            --testing-library swift-testing
