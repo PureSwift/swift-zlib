@@ -398,9 +398,11 @@ struct DeflateCore: ~Copyable {
         let b = Int(bytes[position + 1])
         let c = Int(bytes[position + 2])
 
-        // A multiplicative hash over three bytes, masked to the table size. The constant is odd
-        // and spread across its bits, which is all this needs to scatter well.
-        return ((a &<< 10) ^ (b &<< 5) ^ c) &* 0x9E37 & (Self.hashSize - 1)
+        // The reference's own hash, unrolled: `h = (h << 5) ^ byte` three times over, masked
+        // to the table size. It once carried a multiplicative mix on top, but the mix bought
+        // nothing the mask did not already keep — measured on text, records and random alike —
+        // and cost a multiply on every byte of input.
+        return ((a &<< 10) ^ (b &<< 5) ^ c) & (Self.hashSize - 1)
     }
 
     private mutating func insert(_ bytes: UnsafePointer<UInt8>, at position: Int, limit: Int) {
@@ -587,6 +589,62 @@ struct DeflateCore: ~Copyable {
                 }
 
                 cursor = end
+            }
+
+            // The greedy levels take every match the moment it is found — nothing is ever
+            // deferred — so they get a loop with no deferral bookkeeping in it at all, which
+            // is the same split the reference makes into `deflate_fast` and `deflate_slow`.
+            // Every decision in here is the lazy loop's own with `deferredMatch` pinned to
+            // nil, so the two loops produce the same stream. A match can arrive here already
+            // deferred — a mid-stream level change is allowed to interrupt anything — and
+            // that one call falls through to the lazy loop, which knows how to let it go.
+            if effort.maxLazy == 0, deferredMatch == nil {
+                while cursor + keepBack < limit {
+                    let key = cursor + Self.minMatch <= limit
+                        ? Self.hash(bytes, at: cursor)
+                        : -1
+                    let candidate = key >= 0 ? Int(head[key]) : -1
+
+                    let current: (length: Int, distance: Int)? =
+                        candidate < max(0, cursor - windowSize)
+                        ? nil
+                        : Self.longestMatch(
+                            bytes, at: cursor, limit: limit, holding: 0,
+                            from: candidate, chain: chain, effort: effort,
+                            windowSize: windowSize
+                        )
+
+                    if key >= 0 {
+                        chain[cursor & Self.chainMask] = Int32(truncatingIfNeeded: candidate)
+                        head[key] = Int32(truncatingIfNeeded: cursor)
+                    }
+
+                    if let current {
+                        takeMatch(
+                            current, startingAt: cursor,
+                            cursor: &cursor, symbolCount: &symbolCount
+                        )
+                    } else {
+                        let byte = bytes[cursor]
+                        symbols[symbolCount] = UInt32(byte)
+                        symbolCount += 1
+                        literalFrequencies[Int(byte)] += 1
+                        cursor += 1
+                    }
+
+                    if cursor - blockStart >= Self.maxBlockBytes
+                        || symbolCount >= Self.maxBlockSymbols {
+                        self.cursor = cursor
+                        self.symbolCount = symbolCount
+                        self.flushBlock(final: false)
+                        symbolCount = self.symbolCount
+                        blockStart = self.blockStart
+                    }
+                }
+
+                self.cursor = cursor
+                self.symbolCount = symbolCount
+                return
             }
 
             while cursor + keepBack < limit {
