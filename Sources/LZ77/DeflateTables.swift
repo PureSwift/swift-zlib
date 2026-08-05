@@ -79,6 +79,34 @@ enum DeflateTables {
         8193, 12289, 16385, 24577,
     ]
 
+    /// The inverse of `distanceBase`, in the reference's two-piece shape: the first 256 entries
+    /// answer distances 1...256 directly, the second 256 answer the rest by `(distance - 1) >> 7`
+    /// — sound because every symbol from 17 up covers a range at least 128 wide and aligned to
+    /// 128. Two halves of one array rather than a search, for the same reason as `lengthSymbol`:
+    /// the search it replaces ran up to twenty-nine comparisons, twice per match emitted.
+    static let distanceSymbol: [UInt8] = {
+        var symbols = [UInt8](repeating: 0, count: 512)
+
+        for distance in 1 ... 256 {
+            var symbol = distanceBase.count - 1
+            while distanceBase[symbol] > distance {
+                symbol -= 1
+            }
+            symbols[distance - 1] = UInt8(symbol)
+        }
+
+        for index in 1 ..< 256 {
+            let distance = (index << 7) + 1
+            var symbol = distanceBase.count - 1
+            while distanceBase[symbol] > distance {
+                symbol -= 1
+            }
+            symbols[256 + index] = UInt8(symbol)
+        }
+
+        return symbols
+    }()
+
     /// The literal/length alphabet's end-of-block symbol, the same in every table it appears in.
     static let endOfBlock: UInt16 = 256
 
