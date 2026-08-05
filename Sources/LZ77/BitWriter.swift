@@ -8,13 +8,43 @@
 // most significant bit first, so it is reversed on the way out. That reversal is done here
 // rather than at each call site so that no caller has to remember which of the two orders it is
 // holding.
-struct BitWriter {
+//
+// Completed bytes live in raw memory this struct owns, not in an array, because one write
+// lands per symbol emitted: an array append pays a uniqueness check and a bounds check per
+// byte, and this path pays instead one eight-byte store per flush — the register is written
+// out whole, and only the count of completed bytes advances, so however many bytes the flush
+// completed cost the same single store.
+struct BitWriter: ~Copyable {
     private var buffer: UInt64 = 0
     private var bitCount = 0
 
-    /// Bytes completed since the last time they were taken.
-    private(set) var output: [UInt8] = []
+    private var storage: UnsafeMutablePointer<UInt8>
+    private var capacity: Int
+    private var count = 0
 
+    init() {
+        self.capacity = 1 << 16
+        self.storage = .allocate(capacity: self.capacity)
+    }
+
+    deinit {
+        self.storage.deallocate()
+    }
+
+    /// Room for `extra` more bytes, plus the eight of slack the whole-register store runs into.
+    private mutating func ensure(_ extra: Int) {
+        let needed = self.count + extra + 8
+        guard needed > self.capacity else { return }
+
+        let grown = max(self.capacity * 2, needed)
+        let replacement = UnsafeMutablePointer<UInt8>.allocate(capacity: grown)
+        replacement.update(from: self.storage, count: self.count)
+        self.storage.deallocate()
+        self.storage = replacement
+        self.capacity = grown
+    }
+
+    @inline(__always)
     mutating func write(_ value: UInt32, bits: Int) {
         guard bits > 0 else { return }
 
@@ -22,10 +52,15 @@ struct BitWriter {
         self.buffer |= (UInt64(value) & mask) << self.bitCount
         self.bitCount += bits
 
-        while self.bitCount >= 8 {
-            self.output.append(UInt8(truncatingIfNeeded: self.buffer))
-            self.buffer >>= 8
-            self.bitCount -= 8
+        if self.bitCount >= 8 {
+            self.ensure(8)
+            UnsafeMutableRawPointer(self.storage + self.count)
+                .storeBytes(of: self.buffer.littleEndian, as: UInt64.self)
+
+            let completed = self.bitCount >> 3
+            self.count += completed
+            self.buffer >>= completed << 3
+            self.bitCount &= 7
         }
     }
 
@@ -44,16 +79,19 @@ struct BitWriter {
         return table
     }()
 
-    /// Writes a Huffman code, reversing it so the most significant bit goes out first.
-    ///
-    /// The reversal is a sixteen-bit byte-table reversal shifted down to `bits`, run once per
-    /// symbol written — which is why it is two lookups rather than a loop over the bits.
-    mutating func writeCode(_ code: UInt32, bits: Int) {
+    /// A code turned around into writing order: DEFLATE defines codes most significant bit
+    /// first, and this writer emits low bit first. A sixteen-bit byte-table reversal shifted
+    /// down to `bits` — two lookups rather than a loop over the bits.
+    static func reversed(_ code: UInt32, bits: Int) -> UInt32 {
         let low = Self.reversedByte[Int(code & 0xFF)]
         let high = Self.reversedByte[Int((code >> 8) & 0xFF)]
-        let reversed = (UInt32(low) << 8 | UInt32(high)) >> (16 - bits)
+        return (UInt32(low) << 8 | UInt32(high)) >> (16 - bits)
+    }
 
-        self.write(reversed, bits: bits)
+    /// Writes a Huffman code, reversing it so the most significant bit goes out first.
+    @inline(__always)
+    mutating func writeCode(_ code: UInt32, bits: Int) {
+        self.write(Self.reversed(code, bits: bits), bits: bits)
     }
 
     /// Pads to the next byte boundary with zeroes, which is what a stored block's header needs
@@ -65,35 +103,54 @@ struct BitWriter {
     }
 
     mutating func append(_ bytes: UnsafeBufferPointer<UInt8>) {
-        self.output.append(contentsOf: bytes)
+        guard let base = bytes.baseAddress, bytes.count > 0 else { return }
+
+        self.ensure(bytes.count)
+        (self.storage + self.count).update(from: base, count: bytes.count)
+        self.count += bytes.count
     }
 
     mutating func append(_ byte: UInt8) {
-        self.output.append(byte)
+        self.ensure(1)
+        self.storage[self.count] = byte
+        self.count += 1
     }
 
-    /// Hands over what has completed so far, leaving any partial byte behind for the next write.
-    mutating func takeOutput() -> [UInt8] {
-        let taken = self.output
-        self.output = []
-        return taken
+    /// Copies up to `limit` completed bytes out from the front, keeping the rest — and anything
+    /// written later — behind them in order.
+    mutating func drain(into destination: UnsafeMutablePointer<UInt8>, limit: Int) -> Int {
+        let taking = min(limit, self.count)
+        guard taking > 0 else { return 0 }
+
+        destination.update(from: self.storage, count: taking)
+
+        let remaining = self.count - taking
+        if remaining > 0 {
+            self.storage.update(from: self.storage + taking, count: remaining)
+        }
+        self.count = remaining
+
+        return taking
     }
 
-    /// Returns bytes a caller took but could not place, ahead of anything written since.
-    ///
-    /// Only ever called with a tail of what ``takeOutput()`` just returned, and nothing can have
-    /// been written in between, so this restores the original order rather than interleaving.
-    mutating func putBack(_ bytes: [UInt8]) {
-        self.output.insert(contentsOf: bytes, at: 0)
+    /// An explicit duplicate sharing nothing, for the encoder's own `copied()`.
+    borrowing func copied() -> BitWriter {
+        var clone = BitWriter()
+        clone.ensure(self.count)
+        clone.storage.update(from: self.storage, count: self.count)
+        clone.count = self.count
+        clone.buffer = self.buffer
+        clone.bitCount = self.bitCount
+        return clone
     }
 
     var pendingByteCount: Int {
-        self.output.count
+        self.count
     }
 
     /// Whether anything at all has been written, which is what tells a caller wanting to insert
     /// bits ahead of the stream whether it is still early enough to do so.
     var isEmpty: Bool {
-        self.output.isEmpty && self.bitCount == 0
+        self.count == 0 && self.bitCount == 0
     }
 }
