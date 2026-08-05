@@ -190,12 +190,15 @@ headers and reaches into `struct inflate_state`. Its **24 adversarial streams** 
 reach every error path in inflate — are extracted and run through the public API instead, and
 **every one gives the identical answer**.
 
-**Differential fuzzing of inflate**, which is where zlib's CVEs have been. 6000 streams —
-intact, bit-flipped, truncated, byte-smashed and pure noise, across zlib, raw, gzip and
-auto-detect framing — generated once by the reference so both libraries decode identical
-bytes. **The accept/reject verdict matches on every one, and every accepted stream decodes to
-identical bytes.** One stream salvages a different number of pre-error bytes, which is a
-judgement two decoders may make differently.
+**Differential fuzzing of inflate**, which is where zlib's CVEs have been — and continuous,
+not a campaign that ended: `scripts/run_fuzz.sh` runs in CI on every push and again nightly,
+each run a fresh batch from a printed seed. Per batch, the reference generates 3000 streams —
+mixed payloads and levels across zlib, raw and gzip framing, a share of them bit-flipped or
+truncated — and both libraries decode every one under six input/output chunking patterns:
+18,000 probes. **The verdict must match on every probe, and every accepted stream must decode
+to identical bytes**; that is a gate, not a log line. What is allowed to differ is how many
+bytes came out before an error was reported, since two decoders may discover the same
+corruption at different distances into their own read-ahead.
 
 
 - The built library exports **exactly** the reference's 88 symbols under the reference's own
