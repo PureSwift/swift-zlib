@@ -87,12 +87,16 @@ of them stays in cache, each position hashed once for both the search and the in
 distance symbols answered by the reference's own two-piece table instead of a search, codes
 fused with their bit counts and pre-reversed once per block, the bit writer flushing its whole
 register in one eight-byte store, the loop's state held in locals the way the reference's
-`deflate_slow` holds its — and every one of those changes verified byte-identical over four
-hundred mixed payloads at every level before it stayed. Decompression of zlib-framed data runs
-*faster* than the reference on text and within 10–20% on binary and incompressible data.
-Compression now sits at **parity or better on structured data** — above the reference on
-run-heavy records at every level, even with text at level 1 — and within 10–20% on the
-remaining cells, which is search-loop microarchitecture, not architecture.
+`deflate_slow` holds its, the greedy levels given a loop with no deferral bookkeeping in it
+just as the reference splits `deflate_fast` from `deflate_slow` — and every one of those
+changes verified byte-identical over four hundred mixed payloads at every level before it
+stayed. (One removal was proved rather than measured: the hash once carried a multiplicative
+mix, but an odd constant taken modulo the table size is a bijection — it relabels buckets
+without changing which trigrams share one — so dropping it cost a multiply per input byte
+nothing at all.) Decompression of zlib-framed data runs *faster* than the reference on text
+and within 10–20% on binary and incompressible data. Compression is at **parity or better on
+structured data** — above the reference on run-heavy records at every level and on text at
+level 1 — and within about 10% everywhere else.
 
 The streaming types also carry a span-shaped API alongside the pointer one: input arrives as a
 borrowed `Span` that cannot be stored, output goes through `OutputSpan`, and what a call did
