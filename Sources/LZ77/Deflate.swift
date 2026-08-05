@@ -91,8 +91,11 @@ struct DeflateCore: ~Copyable {
     /// the input does not. The ring is sound because a slot is overwritten only by a position
     /// exactly `chainSize` later — and by then the position it held is out of any window's
     /// reach, which is the condition under which the walk already refuses to follow it.
-    private var head: UnsafeMutablePointer<Int>
-    private var chain: UnsafeMutablePointer<Int>
+    /// Half-width entries on purpose: positions stay far below 2^31 (the window is trimmed in
+    /// step with the cursor), and the two tables together are what a chain walk actually
+    /// touches — at half the width, twice as much of them stays in cache.
+    private var head: UnsafeMutablePointer<Int32>
+    private var chain: UnsafeMutablePointer<Int32>
 
     private static let chainSize = 1 << 15 // the largest windowSize
     private static let chainMask = chainSize - 1
@@ -114,7 +117,8 @@ struct DeflateCore: ~Copyable {
     // input*, which no caller sizing a buffer from `compressBound` is expecting.
 
     /// One entry per symbol: bit 31 clear for a literal in the low byte, bit 31 set for a match
-    /// with its length in bits 0...8 and its distance in bits 9...24.
+    /// with its length in bits 0...8, its distance in bits 9...24, and the distance's alphabet
+    /// symbol in bits 25...29 — carried along so the write loop reads it instead of rederiving.
     ///
     /// Packed into a word rather than an enum because there is one of these per literal byte,
     /// and raw fixed-capacity memory rather than an array because one is appended per literal
@@ -147,12 +151,14 @@ struct DeflateCore: ~Copyable {
 
     /// How often each symbol occurs in the open block, which is what a dynamic block's tables
     /// are fitted to and what all three block types are costed from.
-    private var literalFrequencies = [Int](repeating: 0, count: 286)
-    private var distanceFrequencies = [Int](repeating: 0, count: 30)
+    ///
+    /// Raw memory like `symbols` and for the same reason: one of these counters moves per
+    /// symbol collected, and an array would re-prove its storage unshared on every bump.
+    private var literalFrequencies: UnsafeMutablePointer<Int>
+    private var distanceFrequencies: UnsafeMutablePointer<Int>
 
-    /// Bits spent on the extra-bits fields of the block's matches. The same for every block
-    /// type, since extra bits are written raw whichever coding is chosen.
-    private var extraBits = 0
+    private static let literalSymbolCount = 286
+    private static let distanceSymbolCount = 30
 
     /// A stored block's length is a sixteen-bit field, so a block that might become one cannot
     /// cover more input than that.
@@ -190,6 +196,10 @@ struct DeflateCore: ~Copyable {
         self.chain = .allocate(capacity: Self.chainSize)
         self.chain.initialize(repeating: -1, count: Self.chainSize)
         self.symbols = .allocate(capacity: Self.maxBlockSymbols + 8)
+        self.literalFrequencies = .allocate(capacity: Self.literalSymbolCount)
+        self.literalFrequencies.initialize(repeating: 0, count: Self.literalSymbolCount)
+        self.distanceFrequencies = .allocate(capacity: Self.distanceSymbolCount)
+        self.distanceFrequencies.initialize(repeating: 0, count: Self.distanceSymbolCount)
         self.windowSize = 1 << max(9, min(15, Int(windowBits)))
     }
 
@@ -197,6 +207,8 @@ struct DeflateCore: ~Copyable {
         self.head.deallocate()
         self.chain.deallocate()
         self.symbols.deallocate()
+        self.literalFrequencies.deallocate()
+        self.distanceFrequencies.deallocate()
     }
 
     // -- what a caller can change or carry over ------------------------------------
@@ -292,14 +304,13 @@ struct DeflateCore: ~Copyable {
         clone.head.update(from: self.head, count: Self.hashSize)
         clone.chain.update(from: self.chain, count: Self.chainSize)
 
-        clone.writer = self.writer
+        clone.writer = self.writer.copied()
         clone.symbols.update(from: self.symbols, count: self.symbolCount)
         clone.symbolCount = self.symbolCount
         clone.blockStart = self.blockStart
         clone.deferred = self.deferred
-        clone.literalFrequencies = self.literalFrequencies
-        clone.distanceFrequencies = self.distanceFrequencies
-        clone.extraBits = self.extraBits
+        clone.literalFrequencies.update(from: self.literalFrequencies, count: Self.literalSymbolCount)
+        clone.distanceFrequencies.update(from: self.distanceFrequencies, count: Self.distanceSymbolCount)
         clone.streamEnded = self.streamEnded
 
         return clone
@@ -377,27 +388,12 @@ struct DeflateCore: ~Copyable {
     }
 
     private mutating func drain(into destination: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
-        let available = min(count, self.writer.pendingByteCount)
-
-        guard available > 0 else { return 0 }
-
-        let taken = self.writer.takeOutput()
-
-        taken.withUnsafeBufferPointer { buffer in
-            destination.update(from: buffer.baseAddress!, count: available)
-        }
-
-        if taken.count > available {
-            // More was ready than fit: hand back what did not, ahead of anything written next.
-            self.writer.putBack(Array(taken[available...]))
-        }
-
-        return available
+        self.writer.drain(into: destination, limit: count)
     }
 
     // -- matching --------------------------------------------------------------
 
-    private func hash(_ bytes: UnsafePointer<UInt8>, at position: Int) -> Int {
+    private static func hash(_ bytes: UnsafePointer<UInt8>, at position: Int) -> Int {
         let a = Int(bytes[position])
         let b = Int(bytes[position + 1])
         let c = Int(bytes[position + 2])
@@ -410,9 +406,9 @@ struct DeflateCore: ~Copyable {
     private mutating func insert(_ bytes: UnsafePointer<UInt8>, at position: Int, limit: Int) {
         guard position + Self.minMatch <= limit else { return }
 
-        let key = self.hash(bytes, at: position)
+        let key = Self.hash(bytes, at: position)
         self.chain[position & Self.chainMask] = self.head[key]
-        self.head[key] = position
+        self.head[key] = Int32(truncatingIfNeeded: position)
     }
 
     /// The longest match at `position`, or nil when nothing reaches the minimum length.
@@ -421,11 +417,15 @@ struct DeflateCore: ~Copyable {
     /// finding the first difference with a XOR and a trailing-zero count. Everything about
     /// *which* match wins is unchanged — same walk order, same tie-breaking, same caps — so
     /// the emitted stream is byte-for-byte what the byte-at-a-time loop produced.
-    private func longestMatch(
+    private static func longestMatch(
         _ bytes: UnsafePointer<UInt8>,
         at position: Int,
         limit: Int,
-        holding: Int = 0
+        holding: Int,
+        from first: Int,
+        chain: UnsafePointer<Int32>,
+        effort: Effort,
+        windowSize: Int
     ) -> (length: Int, distance: Int)? {
         guard position + Self.minMatch <= limit else { return nil }
 
@@ -434,30 +434,35 @@ struct DeflateCore: ~Copyable {
 
         let here = bytes + position
 
-        var candidate = self.head[self.hash(bytes, at: position)]
-        var chainLeft = self.effort.maxChainLength
+        var candidate = first
+        var chainLeft = effort.maxChainLength
 
         // A quarter of the budget while a good match is already held: beating it is unlikely,
         // so little is spent trying. The reference's `good_length`, doing exactly this.
-        if self.effort.quarterAt > 0, holding >= self.effort.quarterAt {
+        if effort.quarterAt > 0, holding >= effort.quarterAt {
             chainLeft >>= 2
         }
         var best = 0
         var bestDistance = 0
 
-        let earliest = max(0, position - self.windowSize)
+        // The two bytes over the current best's last byte, reloaded only when the best
+        // improves: a candidate that cannot *beat* the best must differ from it at or before
+        // the byte where the best ends, so comparing this pair first skips the losers
+        // without measuring them — one sixteen-bit load against the reference's `scan_end`,
+        // doing exactly what it does. Only candidates that survive get the full comparison,
+        // so the winner is the same one as ever.
+        var bestEndPair: UInt16 = 0
+
+        let earliest = max(0, position - windowSize)
 
         while candidate >= earliest, chainLeft > 0 {
             chainLeft -= 1
 
             let match = bytes + candidate
 
-            // A candidate that cannot *beat* the current best differs from it at or
-            // before the byte where the best ends, and checking that one byte first
-            // skips the losers without measuring them. Only candidates that survive
-            // get the full comparison, so the winner is the same one as ever.
-            if best > 0, match[best] != here[best] {
-                let next = self.chain[candidate & Self.chainMask]
+            if best > 0,
+               UnsafeRawPointer(match + best - 1).loadUnaligned(as: UInt16.self) != bestEndPair {
+                let next = Int(chain[candidate & Self.chainMask])
                 if next >= candidate { break }
                 candidate = next
                 continue
@@ -490,11 +495,13 @@ struct DeflateCore: ~Copyable {
                 best = length
                 bestDistance = position - candidate
 
-                if best >= self.effort.goodMatch { break }
+                if best >= effort.goodMatch { break }
                 if best >= maxLength { break } // nothing left to beat
+
+                bestEndPair = UnsafeRawPointer(here + best - 1).loadUnaligned(as: UInt16.self)
             }
 
-            let next = self.chain[candidate & Self.chainMask]
+            let next = Int(chain[candidate & Self.chainMask])
             if next >= candidate { break }
             candidate = next
         }
@@ -530,45 +537,141 @@ struct DeflateCore: ~Copyable {
                 return
             }
 
-            while self.cursor + keepBack < limit {
-                let heldLength = self.deferred?.length ?? 0
+            // The loop-carried state lives in locals, written back at each block flush and
+            // at exit. The reference's inner loop has exactly this shape for exactly this
+            // reason: a loop mutating fields of `self` re-proves and re-reads them through
+            // memory at every touch, and this loop touches them for every input byte.
+            let head = self.head
+            let chain = self.chain
+            let symbols = self.symbols
+            let literalFrequencies = self.literalFrequencies
+            let distanceFrequencies = self.distanceFrequencies
+            let effort = self.effort
+            let windowSize = self.windowSize
+
+            var cursor = self.cursor
+            var symbolCount = self.symbolCount
+            var deferredMatch = self.deferred
+            var blockStart = self.blockStart
+
+            // Committing to a match: the symbol goes into the block, and the positions the
+            // match covers go into the hash chain — except inside long matches at the greedy
+            // levels, which the reference leaves unindexed too: the run's head already is,
+            // and hashing the rest costs more than it finds.
+            func takeMatch(
+                _ match: (length: Int, distance: Int),
+                startingAt start: Int,
+                cursor: inout Int,
+                symbolCount: inout Int
+            ) {
+                let lengthSymbol = Int(DeflateTables.lengthSymbol[match.length - Self.minMatch])
+                let distanceSymbol = Self.distanceSymbol(for: match.distance)
+
+                symbols[symbolCount] = 0x8000_0000
+                    | UInt32(match.length)
+                    | UInt32(match.distance) << 9
+                    | UInt32(distanceSymbol) << 25
+                symbolCount += 1
+                literalFrequencies[257 + lengthSymbol] += 1
+                distanceFrequencies[distanceSymbol] += 1
+
+                let end = start + match.length
+
+                if end > cursor + 1, match.length <= effort.maxInsert {
+                    for position in (cursor + 1) ..< end {
+                        guard position + Self.minMatch <= limit else { break }
+                        let key = Self.hash(bytes, at: position)
+                        chain[position & Self.chainMask] = head[key]
+                        head[key] = Int32(truncatingIfNeeded: position)
+                    }
+                }
+
+                cursor = end
+            }
+
+            while cursor + keepBack < limit {
+                let heldLength = deferredMatch?.length ?? 0
+
+                // One hash and one head read serve both the search and the insertion below
+                // it, since all three are asking about the same three bytes. The key is
+                // negative when those bytes run off the end, which is also exactly when
+                // none of them has anything to do.
+                let key = cursor + Self.minMatch <= limit
+                    ? Self.hash(bytes, at: cursor)
+                    : -1
+                let candidate = key >= 0 ? Int(head[key]) : -1
 
                 // The reference's economy, adopted whole: while a match at least `maxLazy`
                 // long is already in hand, no better one is even looked for — the search
-                // would usually lose, and it is the single most expensive thing here.
+                // would usually lose, and it is the single most expensive thing here. A
+                // head entry already out of the window skips the search the same way: the
+                // walk's first test would refuse it, so there is no call worth making.
                 let current: (length: Int, distance: Int)? =
-                    heldLength > 0 && heldLength >= self.effort.maxLazy
+                    candidate < max(0, cursor - windowSize)
+                        || (heldLength > 0 && heldLength >= effort.maxLazy)
                     ? nil
-                    : self.longestMatch(bytes, at: self.cursor, limit: limit, holding: heldLength)
+                    : Self.longestMatch(
+                        bytes, at: cursor, limit: limit, holding: heldLength,
+                        from: candidate, chain: chain, effort: effort, windowSize: windowSize
+                    )
 
-                self.insert(bytes, at: self.cursor, limit: limit)
+                if key >= 0 {
+                    chain[cursor & Self.chainMask] = Int32(truncatingIfNeeded: candidate)
+                    head[key] = Int32(truncatingIfNeeded: cursor)
+                }
 
-                if let held = self.deferred {
+                if let held = deferredMatch {
                     if let current, current.length > held.length {
                         // Starting a byte later pays better, so the byte the held match began
                         // on becomes a literal and the new match is held in its place.
-                        self.appendLiteral(bytes[self.cursor - 1])
-                        self.deferred = current
-                        self.cursor += 1
+                        let byte = bytes[cursor - 1]
+                        symbols[symbolCount] = UInt32(byte)
+                        symbolCount += 1
+                        literalFrequencies[Int(byte)] += 1
+                        deferredMatch = current
+                        cursor += 1
                     } else {
-                        self.take(held, startingAt: self.cursor - 1, bytes: bytes, limit: limit)
+                        takeMatch(
+                            held, startingAt: cursor - 1,
+                            cursor: &cursor, symbolCount: &symbolCount
+                        )
+                        deferredMatch = nil
                     }
                 } else if let current {
                     // A match already long enough is taken without looking further: past the
                     // level's threshold the search costs more than the byte it might save.
-                    if current.length < self.effort.maxLazy {
-                        self.deferred = current
-                        self.cursor += 1
+                    if current.length < effort.maxLazy {
+                        deferredMatch = current
+                        cursor += 1
                     } else {
-                        self.take(current, startingAt: self.cursor, bytes: bytes, limit: limit)
+                        takeMatch(
+                            current, startingAt: cursor,
+                            cursor: &cursor, symbolCount: &symbolCount
+                        )
                     }
                 } else {
-                    self.appendLiteral(bytes[self.cursor])
-                    self.cursor += 1
+                    let byte = bytes[cursor]
+                    symbols[symbolCount] = UInt32(byte)
+                    symbolCount += 1
+                    literalFrequencies[Int(byte)] += 1
+                    cursor += 1
                 }
 
-                if self.blockIsFull { self.flushBlock(final: false) }
+                let emittedEnd = deferredMatch == nil ? cursor : cursor - 1
+                if emittedEnd - blockStart >= Self.maxBlockBytes
+                    || symbolCount >= Self.maxBlockSymbols {
+                    self.cursor = cursor
+                    self.symbolCount = symbolCount
+                    self.deferred = deferredMatch
+                    self.flushBlock(final: false)
+                    symbolCount = self.symbolCount
+                    blockStart = self.blockStart
+                }
             }
+
+            self.cursor = cursor
+            self.symbolCount = symbolCount
+            self.deferred = deferredMatch
         }
 
         self.trimWindow()
@@ -633,15 +736,16 @@ struct DeflateCore: ~Copyable {
         self.cursor -= drop
         self.blockStart -= drop
 
+        let drop32 = Int32(truncatingIfNeeded: drop)
         for index in 0 ..< Self.hashSize {
-            self.head[index] = self.head[index] >= drop ? self.head[index] - drop : -1
+            self.head[index] = self.head[index] >= drop32 ? self.head[index] - drop32 : -1
         }
 
         // The ring's slots stay where they are — `(position - drop) & chainMask` is not
         // `position & chainMask`, but the slot for a position is only ever *read* through the
         // same masked arithmetic it was written through, so only the values need rebasing.
         for index in 0 ..< Self.chainSize {
-            self.chain[index] = self.chain[index] >= drop ? self.chain[index] - drop : -1
+            self.chain[index] = self.chain[index] >= drop32 ? self.chain[index] - drop32 : -1
         }
     }
 
@@ -654,28 +758,41 @@ struct DeflateCore: ~Copyable {
     }
 
     private mutating func appendMatch(length: Int, distance: Int) {
-        self.symbols[self.symbolCount] = 0x8000_0000 | UInt32(length) | (UInt32(distance) << 9)
-        self.symbolCount += 1
-
         let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
         let distanceSymbol = Self.distanceSymbol(for: distance)
 
+        self.symbols[self.symbolCount] = 0x8000_0000
+            | UInt32(length)
+            | UInt32(distance) << 9
+            | UInt32(distanceSymbol) << 25
+        self.symbolCount += 1
+
         self.literalFrequencies[257 + lengthSymbol] += 1
         self.distanceFrequencies[distanceSymbol] += 1
+    }
 
-        self.extraBits +=
-            DeflateTables.lengthExtraBits[lengthSymbol]
-            + DeflateTables.distanceExtraBits[distanceSymbol]
+    /// Bits the block's matches will spend on raw extra-bits fields — the same under every
+    /// block type, since extra bits are written raw whichever coding is chosen. Recovered
+    /// from the frequency counts at closing time rather than accumulated per match: each
+    /// symbol's extra width is fixed, so the sum is fifty-nine multiplies once per block
+    /// instead of two table reads per match.
+    private func pendingExtraBits() -> Int {
+        var bits = 0
+
+        for symbol in 0 ..< DeflateTables.lengthExtraBits.count {
+            bits += self.literalFrequencies[257 + symbol] * DeflateTables.lengthExtraBits[symbol]
+        }
+        for symbol in 0 ..< Self.distanceSymbolCount {
+            bits += self.distanceFrequencies[symbol] * DeflateTables.distanceExtraBits[symbol]
+        }
+
+        return bits
     }
 
     private static func distanceSymbol(for distance: Int) -> Int {
-        var symbol = DeflateTables.distanceBase.count - 1
-
-        while DeflateTables.distanceBase[symbol] > distance {
-            symbol -= 1
-        }
-
-        return symbol
+        distance <= 256
+            ? Int(DeflateTables.distanceSymbol[distance - 1])
+            : Int(DeflateTables.distanceSymbol[256 + ((distance - 1) >> 7)])
     }
 
     /// §3.2.6: how many bits the fixed alphabet spends on one literal/length symbol.
@@ -705,13 +822,18 @@ struct DeflateCore: ~Copyable {
 
         // Three bits of header, then what each coding spends. Stored also pays up to seven bits
         // of padding to reach a byte boundary and four bytes of length and complement.
-        let fixedBits = 3 + self.fixedCostBits()
+        let extraBits = self.pendingExtraBits()
+        let fixedBits = 3 + self.fixedCostBits(extraBits: extraBits)
         let storedBits = 3 + 7 + 32 + storedLength * 8
 
         let dynamic = DynamicBlock(
-            literalFrequencies: self.literalFrequencies,
-            distanceFrequencies: self.distanceFrequencies,
-            extraBits: self.extraBits
+            literalFrequencies: Array(UnsafeBufferPointer(
+                start: self.literalFrequencies, count: Self.literalSymbolCount
+            )),
+            distanceFrequencies: Array(UnsafeBufferPointer(
+                start: self.distanceFrequencies, count: Self.distanceSymbolCount
+            )),
+            extraBits: extraBits
         )
 
         if storedLength <= Self.maxBlockBytes, storedBits <= min(fixedBits, dynamic.totalBits) {
@@ -730,22 +852,21 @@ struct DeflateCore: ~Copyable {
         }
 
         self.symbolCount = 0
-        self.extraBits = 0
         self.blockStart = blockEnd
 
-        for index in self.literalFrequencies.indices { self.literalFrequencies[index] = 0 }
-        for index in self.distanceFrequencies.indices { self.distanceFrequencies[index] = 0 }
+        self.literalFrequencies.update(repeating: 0, count: Self.literalSymbolCount)
+        self.distanceFrequencies.update(repeating: 0, count: Self.distanceSymbolCount)
     }
 
     /// What this block's symbols would cost under §3.2.6's fixed alphabet.
-    private func fixedCostBits() -> Int {
-        var bits = self.extraBits
+    private func fixedCostBits(extraBits: Int) -> Int {
+        var bits = extraBits
 
-        for symbol in self.literalFrequencies.indices where self.literalFrequencies[symbol] > 0 {
+        for symbol in 0 ..< Self.literalSymbolCount where self.literalFrequencies[symbol] > 0 {
             bits += self.literalFrequencies[symbol] * Self.literalOrLengthBits(UInt16(symbol))
         }
 
-        for symbol in self.distanceFrequencies.indices {
+        for symbol in 0 ..< Self.distanceSymbolCount {
             // Every distance code is five bits in the fixed alphabet.
             bits += self.distanceFrequencies[symbol] * 5
         }
@@ -813,7 +934,8 @@ struct DeflateCore: ~Copyable {
 
             self.writeMatch(
                 length: Int(symbol & 0x1FF),
-                distance: Int((symbol >> 9) & 0xFFFF)
+                distance: Int((symbol >> 9) & 0xFFFF),
+                distanceSymbol: Int((symbol >> 25) & 0x1F)
             )
         }
 
@@ -826,54 +948,57 @@ struct DeflateCore: ~Copyable {
 
         table.writeTable(to: &self.writer)
 
-        for index in 0 ..< self.symbolCount {
-            let symbol = self.symbols[index]
-            guard symbol & 0x8000_0000 != 0 else {
-                let literal = Int(symbol & 0xFF)
-                self.writer.writeCode(
-                    table.literalCodes[literal],
-                    bits: Int(table.literalLengths[literal])
-                )
-                continue
-            }
+        // The tables the loop reads, hoisted out of it: the statics so their once-token is
+        // checked here and not per symbol, the block's own so each code is a load with no
+        // bounds proof left to run.
+        let lengthSymbol = DeflateTables.lengthSymbol
+        let lengthExtraBits = DeflateTables.lengthExtraBits
+        let lengthBase = DeflateTables.lengthBase
+        let distanceExtraBits = DeflateTables.distanceExtraBits
+        let distanceBase = DeflateTables.distanceBase
 
-            let length = Int(symbol & 0x1FF)
-            let distance = Int((symbol >> 9) & 0xFFFF)
+        table.literalEmit.withUnsafeBufferPointer { literalEmit in
+            table.distanceEmit.withUnsafeBufferPointer { distanceEmit in
+                for index in 0 ..< self.symbolCount {
+                    let symbol = self.symbols[index]
+                    guard symbol & 0x8000_0000 != 0 else {
+                        let emit = literalEmit[Int(symbol & 0xFF)]
+                        self.writer.write(emit & 0xFFFF, bits: Int(emit >> 16))
+                        continue
+                    }
 
-            let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
-            self.writer.writeCode(
-                table.literalCodes[257 + lengthSymbol],
-                bits: Int(table.literalLengths[257 + lengthSymbol])
-            )
+                    let length = Int(symbol & 0x1FF)
+                    let distance = Int((symbol >> 9) & 0xFFFF)
+                    let distanceSymbol = Int((symbol >> 25) & 0x1F)
 
-            let lengthExtra = DeflateTables.lengthExtraBits[lengthSymbol]
-            if lengthExtra > 0 {
-                self.writer.write(
-                    UInt32(length - DeflateTables.lengthBase[lengthSymbol]),
-                    bits: lengthExtra
-                )
-            }
+                    let lengthIndex = Int(lengthSymbol[length - Self.minMatch])
+                    let lengthEmit = literalEmit[257 + lengthIndex]
+                    self.writer.write(lengthEmit & 0xFFFF, bits: Int(lengthEmit >> 16))
 
-            let distanceSymbol = Self.distanceSymbol(for: distance)
-            self.writer.writeCode(
-                table.distanceCodes[distanceSymbol],
-                bits: Int(table.distanceLengths[distanceSymbol])
-            )
+                    let lengthExtra = lengthExtraBits[lengthIndex]
+                    if lengthExtra > 0 {
+                        self.writer.write(
+                            UInt32(length - lengthBase[lengthIndex]),
+                            bits: lengthExtra
+                        )
+                    }
 
-            let distanceExtra = DeflateTables.distanceExtraBits[distanceSymbol]
-            if distanceExtra > 0 {
-                self.writer.write(
-                    UInt32(distance - DeflateTables.distanceBase[distanceSymbol]),
-                    bits: distanceExtra
-                )
+                    let emit = distanceEmit[distanceSymbol]
+                    self.writer.write(emit & 0xFFFF, bits: Int(emit >> 16))
+
+                    let distanceExtra = distanceExtraBits[distanceSymbol]
+                    if distanceExtra > 0 {
+                        self.writer.write(
+                            UInt32(distance - distanceBase[distanceSymbol]),
+                            bits: distanceExtra
+                        )
+                    }
+                }
             }
         }
 
-        let endOfBlock = Int(DeflateTables.endOfBlock)
-        self.writer.writeCode(
-            table.literalCodes[endOfBlock],
-            bits: Int(table.literalLengths[endOfBlock])
-        )
+        let endEmit = table.literalEmit[Int(DeflateTables.endOfBlock)]
+        self.writer.write(endEmit & 0xFFFF, bits: Int(endEmit >> 16))
     }
 
     // -- fixed-Huffman symbol emission ------------------------------------------
@@ -893,7 +1018,7 @@ struct DeflateCore: ~Copyable {
         }
     }
 
-    private mutating func writeMatch(length: Int, distance: Int) {
+    private mutating func writeMatch(length: Int, distance: Int, distanceSymbol: Int) {
         let lengthSymbol = Int(DeflateTables.lengthSymbol[length - Self.minMatch])
 
         self.writeLiteralOrLength(UInt16(257 + lengthSymbol))
@@ -905,8 +1030,6 @@ struct DeflateCore: ~Copyable {
                 bits: lengthExtra
             )
         }
-
-        let distanceSymbol = Self.distanceSymbol(for: distance)
 
         // Distance codes are five bits each in the fixed alphabet, written most significant bit
         // first like any other code.

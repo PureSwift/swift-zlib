@@ -19,6 +19,13 @@ struct DynamicBlock {
     let distanceLengths: [UInt8]
     let distanceCodes: [UInt32]
 
+    /// Code and length fused, with the code already bit-reversed into writing order: the
+    /// low sixteen bits go straight to the writer and bits 16... say how many. Built once
+    /// per block so the symbol loop — the hot one — pays a single load per code instead of
+    /// a reversal per symbol.
+    let literalEmit: [UInt32]
+    let distanceEmit: [UInt32]
+
     let codeLengthLengths: [UInt8]
     let codeLengthCodes: [UInt32]
 
@@ -59,6 +66,9 @@ struct DynamicBlock {
 
         self.literalCodes = HuffmanBuilder.codes(lengths: literalLengths, maxBits: Self.maxBits)
         self.distanceCodes = HuffmanBuilder.codes(lengths: distanceLengths, maxBits: Self.maxBits)
+
+        self.literalEmit = Self.fuse(codes: self.literalCodes, lengths: literalLengths)
+        self.distanceEmit = Self.fuse(codes: self.distanceCodes, lengths: distanceLengths)
 
         // Only as many codes as are actually needed; the tail of unused ones is not sent. The
         // literal alphabet never drops below 257, because that is where the length codes start.
@@ -119,6 +129,17 @@ struct DynamicBlock {
         }
 
         self.totalBits = bits + extraBits
+    }
+
+    private static func fuse(codes: [UInt32], lengths: [UInt8]) -> [UInt32] {
+        var emit = [UInt32](repeating: 0, count: codes.count)
+
+        for index in codes.indices where lengths[index] > 0 {
+            let bits = Int(lengths[index])
+            emit[index] = BitWriter.reversed(codes[index], bits: bits) | UInt32(bits) << 16
+        }
+
+        return emit
     }
 
     /// §3.2.7's run-length encoding of the code lengths: 16 repeats the previous length, 17 and
