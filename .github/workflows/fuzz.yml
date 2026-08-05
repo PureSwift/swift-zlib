@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build gcc make
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake ninja-build gcc make python3
 
       # Pinned by building it, exactly as ci.yml pins it: noble ships 1.3, and behaviour is
       # compared against 1.3.1.
