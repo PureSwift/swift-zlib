@@ -27,16 +27,22 @@ public struct Adler32 {
     }
 
     public mutating func update(_ bytes: UnsafeBufferPointer<UInt8>) {
-        // Two deferrals at once. The modulo is deferred the classic way: neither sum can
-        // overflow 32 bits within 5552 bytes (zlib's NMAX), so the reduction runs once per
-        // block rather than once per byte. And within each sixteen-byte group the serial
-        // dependence of `second` on every intermediate `first` is unrolled algebraically —
+        // Two deferrals, and one piece of algebra that makes the whole run vectorise.
         //
-        //     second += 16*first + 16*b0 + 15*b1 + ... + 1*b15
-        //     first  += b0 + ... + b15
+        // The modulo is deferred the classic way: neither sum can overflow within 5552 bytes
+        // (zlib's NMAX), so the reduction runs once per block.  The serial dependence — 
+        // absorbs  after every byte — is removed for the whole block at once rather than
+        // per group of sixteen: over a run of n bytes,
         //
-        // — which turns a chain of dependent adds into two independent reductions the
-        // compiler is free to vectorize. Same arithmetic, in a shape hardware can run wide.
+        //     first'  = first + P                       where P = b1 + ... + bn
+        //     second' = second + n*first + sum (n-k+1) * bk
+        //
+        // and with the run walked sixteen lanes at a time, byte k sits at chunk c, lane l, so
+        // its weight n - 16c - l splits into three pieces: n times the plain sum, sixteen times
+        // the chunk-weighted sum, and the lane-weighted sum.  The first two are one vector
+        // accumulator each — two multiply-accumulates per sixteen bytes, no horizontal step
+        // anywhere in the loop — and the lane weighting falls out of the plain accumulator at
+        // the end, since lane l of it holds exactly the bytes that want weight l.
         guard var cursor = bytes.baseAddress else { return }
         var remaining = bytes.count
 
@@ -44,31 +50,38 @@ public struct Adler32 {
         var second = self.second
 
         while remaining >= 16 {
-            var groups = min(remaining / 16, 347) // 347 * 16 = 5552, the reduction budget
+            let groups = min(remaining / 16, 347) // 347 * 16 = 5552, the reduction budget
 
             remaining -= groups * 16
 
-            while groups > 0 {
-                second &+= first &* 16
+            var plainLanes = SIMD16<UInt32>()
+            var chunkWeighted = SIMD16<UInt32>()
 
-                var plain: UInt32 = 0
-                var weighted: UInt32 = 0
+            for chunk in 0 ..< UInt32(groups) {
+                let wide = SIMD16<UInt32>(
+                    truncatingIfNeeded: UnsafeRawPointer(cursor)
+                        .loadUnaligned(as: SIMD16<UInt8>.self)
+                )
 
-                for offset in 0 ..< 16 {
-                    let byte = UInt32(cursor[offset])
-                    plain &+= byte
-                    weighted &+= byte &* UInt32(16 - offset)
-                }
-
-                first &+= plain
-                second &+= weighted
-
+                plainLanes &+= wide
+                chunkWeighted &+= wide &* SIMD16<UInt32>(repeating: chunk)
                 cursor += 16
-                groups -= 1
             }
 
-            first %= Self.modulus
-            second %= Self.modulus
+            // The reduction, in sixty-four bits: n*P alone can reach eight billion.
+            let n = UInt64(groups * 16)
+            let plain = UInt64(plainLanes.wrappedSum())
+
+            var laneWeighted: UInt64 = 0
+            for lane in 1 ..< 16 {
+                laneWeighted += UInt64(lane) * UInt64(plainLanes[lane])
+            }
+
+            let absorbed = n * UInt64(first) + n * plain
+                - 16 * UInt64(chunkWeighted.wrappedSum()) - laneWeighted
+
+            first = UInt32((UInt64(first) + plain) % UInt64(Self.modulus))
+            second = UInt32((UInt64(second) + absorbed) % UInt64(Self.modulus))
         }
 
         for offset in 0 ..< remaining {
