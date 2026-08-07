@@ -214,7 +214,7 @@ public final class Decompressor {
                     | ((raw >> 24) & 0xFF)
 
                 guard !self.validatesChecksum || stored == self.checksumState.value else {
-                    throw DeflateError("Adler-32 checksum mismatch")
+                    throw DeflateError("incorrect data check")
                 }
 
                 self.state = .done
@@ -236,11 +236,11 @@ public final class Decompressor {
         let flg = (raw >> 8) & 0xFF
 
         guard (cmf * 256 + flg) % 31 == 0 else {
-            throw DeflateError("bad zlib header")
+            throw DeflateError("incorrect header check")
         }
 
         guard cmf & 0x0F == 8 else {
-            throw DeflateError("unsupported compression method")
+            throw DeflateError("unknown compression method")
         }
 
         // The window as a power of two, less eight. Beyond fifteen is outside the format;
@@ -250,12 +250,12 @@ public final class Decompressor {
         let declared = Int32((cmf >> 4) & 0x0F) + 8
 
         guard declared <= 15 else {
-            throw DeflateError("zlib window size out of range")
+            throw DeflateError("invalid window size")
         }
 
         if let maximumWindowBits = self.maximumWindowBits {
             guard declared <= maximumWindowBits else {
-                throw DeflateError("zlib window size larger than requested")
+                throw DeflateError("invalid window size")
             }
         }
     }

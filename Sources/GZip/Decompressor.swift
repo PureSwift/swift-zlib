@@ -172,7 +172,7 @@ public final class Decompressor {
 
                 guard stored == UInt16(truncatingIfNeeded: self.headerChecksumState.checksum)
                 else {
-                    throw DeflateError("gzip header checksum mismatch")
+                    throw DeflateError("header crc mismatch")
                 }
 
                 self.headerIsComplete = true
@@ -220,7 +220,7 @@ public final class Decompressor {
                 // Least significant byte first, which is the order `readBits` already assembles
                 // — the opposite of zlib's trailer, which had to be reversed.
                 guard !self.validatesChecksum || raw == self.checksumState.checksum else {
-                    throw DeflateError("gzip CRC-32 mismatch")
+                    throw DeflateError("incorrect data check")
                 }
 
                 self.state = .trailerLength
@@ -232,7 +232,7 @@ public final class Decompressor {
                 // whose length does not is one that decoded to the right bytes and the wrong
                 // number of them, which no checksum alone would catch.
                 guard !self.validatesChecksum || raw == self.producedLength else {
-                    throw DeflateError("gzip length mismatch")
+                    throw DeflateError("incorrect length check")
                 }
 
                 self.state = .done
@@ -288,21 +288,21 @@ public final class Decompressor {
     /// Checks as much of the fixed header as has arrived.
     private func validateHeaderPrefix() throws(DeflateError) {
         if self.field.count >= 1, self.field[0] != 0x1F {
-            throw DeflateError("not a gzip member")
+            throw DeflateError("incorrect header check")
         }
 
         if self.field.count >= 2, self.field[1] != 0x8B {
-            throw DeflateError("not a gzip member")
+            throw DeflateError("incorrect header check")
         }
 
         if self.field.count >= 3, self.field[2] != 8 {
-            throw DeflateError("unsupported compression method")
+            throw DeflateError("unknown compression method")
         }
 
         // §2.3.1.2 reserves the top three flag bits and requires a decoder to refuse a member
         // that sets them, rather than guess what they were meant to mean.
         if self.field.count >= 4, self.field[3] & 0xE0 != 0 {
-            throw DeflateError("reserved gzip flags are set")
+            throw DeflateError("unknown header flags set")
         }
     }
 
