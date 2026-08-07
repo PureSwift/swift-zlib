@@ -55,18 +55,23 @@ public struct Adler32 {
             remaining -= groups * 16
 
             var plainLanes = SIMD16<UInt32>()
-            var chunkWeighted = SIMD16<UInt32>()
+            var prefixes = SIMD16<UInt32>()
 
-            for chunk in 0 ..< UInt32(groups) {
+            for _ in 0 ..< groups {
                 let wide = SIMD16<UInt32>(
                     truncatingIfNeeded: UnsafeRawPointer(cursor)
                         .loadUnaligned(as: SIMD16<UInt8>.self)
                 )
 
+                // No multiply: the chunk weighting is recovered from the running prefixes.  A
+                // byte in chunk c appears in every prefix from c on — G - c of them — so
+                // per lane, sum(c * b) = G * plain - sum(prefixes), and the loop is two adds.
                 plainLanes &+= wide
-                chunkWeighted &+= wide &* SIMD16<UInt32>(repeating: chunk)
+                prefixes &+= plainLanes
                 cursor += 16
             }
+
+            let chunkWeighted = SIMD16<UInt32>(repeating: UInt32(groups)) &* plainLanes &- prefixes
 
             // The reduction, in sixty-four bits: n*P alone can reach eight billion.
             let n = UInt64(groups * 16)
