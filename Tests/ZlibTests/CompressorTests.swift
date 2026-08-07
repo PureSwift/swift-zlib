@@ -138,4 +138,33 @@ struct CompressorTests {
 
         #expect(try DecompressorTests.inflate(compressed, into: payload.count * 2 + 64) == payload)
     }
+
+    /// The vectorised checksum against the bytewise definition, across every boundary the
+    /// vector path has: the sixteen-byte grouping, the 5552-byte reduction budget, both at
+    /// once, and a split update whose state has to carry across the call.
+    @Test("The block checksum is the bytewise checksum", arguments:
+        [0, 1, 15, 16, 17, 31, 5551, 5552, 5553, 11104, 100_000] as [Int])
+    func adlerAgreesWithDefinition(_ size: Int) {
+        var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+
+        var data = [UInt8](repeating: 0, count: size)
+        for index in 0 ..< size {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17
+            data[index] = index % 3 == 0 ? 255 : UInt8(truncatingIfNeeded: seed >> 41)
+        }
+
+        var bytewise = Adler32()
+        for byte in data { bytewise.update(byte) }
+
+        var block = Adler32()
+        data.withUnsafeBufferPointer { block.update($0) }
+        #expect(block.value == bytewise.value)
+
+        if size > 40 {
+            var split = Adler32()
+            data[0 ..< 23].withUnsafeBufferPointer { split.update($0) }
+            data[23...].withUnsafeBufferPointer { split.update($0) }
+            #expect(split.value == bytewise.value)
+        }
+    }
 }
