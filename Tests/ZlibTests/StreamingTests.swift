@@ -161,4 +161,45 @@ struct StreamingTests {
                 == Self.payload
         )
     }
+
+    /// A flush is once for what has arrived, not once per call.  Callers drive a flush the way
+    /// zlib documents — repeat while the output keeps coming — so a compressor that re-emits the
+    /// empty sync block on every call turns that loop into forever.
+    @Test("A repeated flush with nothing new is a no-op")
+    func flushIsIdempotent() throws {
+        let compressor = Compressor(level: 6)
+        var output = [UInt8](repeating: 0, count: 256)
+
+        let payload = Array("hello hello hello".utf8)
+        payload.withUnsafeBufferPointer { compressor.setInput($0) }
+
+        let first = try output.withUnsafeMutableBufferPointer {
+            try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .flush)
+        }
+        #expect(first > 0)
+
+        let second = try output.withUnsafeMutableBufferPointer {
+            try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .flush)
+        }
+        #expect(second == 0)
+
+        // New input arms the next flush again.
+        payload.withUnsafeBufferPointer { compressor.setInput($0) }
+
+        let third = try output.withUnsafeMutableBufferPointer {
+            try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .flush)
+        }
+        #expect(third > 0)
+
+        // A full flush outranks a plain one, so it still runs — and is then spent too.
+        let fourth = try output.withUnsafeMutableBufferPointer {
+            try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .fullFlush)
+        }
+        #expect(fourth > 0)
+
+        let fifth = try output.withUnsafeMutableBufferPointer {
+            try compressor.deflate(into: $0.baseAddress!, count: $0.count, ending: .fullFlush)
+        }
+        #expect(fifth == 0)
+    }
 }

@@ -380,7 +380,7 @@ struct InflateCore: ~Copyable {
                 self.state = .dynamicCounts
 
             default:
-                throw DeflateError("reserved block type")
+                throw DeflateError("invalid block type")
             }
 
             return true
@@ -392,7 +392,7 @@ struct InflateCore: ~Copyable {
             let complement = Int((raw >> 16) & 0xFFFF)
 
             guard length == (complement ^ 0xFFFF) else {
-                throw DeflateError("stored block length check failed")
+                throw DeflateError("invalid stored block lengths")
             }
 
             self.storedRemaining = length
@@ -563,11 +563,11 @@ struct InflateCore: ~Copyable {
                     self.endBlock()
                     return true
                 case .invalidLengthSymbol:
-                    throw DeflateError("invalid length symbol")
+                    throw DeflateError("invalid literal/length code")
                 case .invalidDistanceSymbol:
-                    throw DeflateError("invalid distance symbol")
+                    throw DeflateError("invalid distance code")
                 case .distanceTooFar:
-                    throw DeflateError("match distance reaches before the start of the stream")
+                    throw DeflateError("invalid distance too far back")
                 case .paused:
                     break
                 }
@@ -608,7 +608,7 @@ struct InflateCore: ~Copyable {
                     }
 
                     guard symbol <= 285 else {
-                        throw DeflateError("invalid length symbol")
+                        throw DeflateError("invalid literal/length code")
                     }
 
                     self.pendingSymbol = symbol
@@ -638,7 +638,7 @@ struct InflateCore: ~Copyable {
 
             case let .symbol(symbol):
                 guard symbol <= 29 else {
-                    throw DeflateError("invalid distance symbol")
+                    throw DeflateError("invalid distance code")
                 }
 
                 self.pendingSymbol = symbol
@@ -657,7 +657,7 @@ struct InflateCore: ~Copyable {
             guard self.matchDistance >= 1,
                   self.matchDistance <= min(DeflateTables.windowSize, self.totalProduced)
             else {
-                throw DeflateError("match distance reaches before the start of the stream")
+                throw DeflateError("invalid distance too far back")
             }
 
             self.symbolPartial = HuffmanTable.Partial()
@@ -998,7 +998,7 @@ struct InflateCore: ~Copyable {
     /// "extend the array by `count` entries" operation.
     private mutating func repeatPreviousLength(count: Int) throws(DeflateError) {
         guard self.combinedLengthsIndex > 0 else {
-            throw DeflateError("repeat code with nothing to repeat")
+            throw DeflateError("invalid bit length repeat")
         }
 
         try self.fill(self.previousCodeLength, count: count)
@@ -1011,7 +1011,7 @@ struct InflateCore: ~Copyable {
 
     private mutating func fill(_ value: UInt8, count: Int) throws(DeflateError) {
         guard self.combinedLengthsIndex + count <= self.combinedLengths.count else {
-            throw DeflateError("code-length repeat runs past the table")
+            throw DeflateError("invalid bit length repeat")
         }
 
         for _ in 0 ..< count {

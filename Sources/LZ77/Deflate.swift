@@ -174,6 +174,11 @@ struct DeflateCore: ~Copyable {
     /// been handed over, because a caller told "finished" stops asking for bytes.
     private var streamEnded = false
 
+    /// How hard the stream has been flushed since input last arrived: nothing, a sync flush,
+    /// or a full flush.  What makes a repeated flush a no-op rather than a stutter of empty
+    /// blocks — see the deflate loop.
+    private var flushRankSinceInput = 0
+
     /// Whether the stream has ended *and* every byte of it has been taken. The analogue of
     /// zlib's `Z_STREAM_END`, which likewise never arrives while output is still waiting.
     var isFinished: Bool {
@@ -335,6 +340,7 @@ struct DeflateCore: ~Copyable {
         guard !bytes.isEmpty else { return }
 
         self.pending.append(contentsOf: bytes)
+        self.flushRankSinceInput = 0
     }
 
     typealias Ending = Deflate.Ending
@@ -363,15 +369,28 @@ struct DeflateCore: ~Copyable {
                 break
 
             case .flush:
+                // Once for what has arrived, not once per call: a flush with nothing new since
+                // the last one is a no-op, which is the contract's own answer — zlib produces
+                // no bytes for it, and callers are written against that.  Each marker says
+                // "everything so far is delivered", and saying it twice would write empty
+                // blocks a decoder has to skip for as long as the caller keeps asking.
+                guard self.flushRankSinceInput < 1 else { break }
+
                 self.resolveDeferred()
                 self.flushBlock(final: false)
                 self.writeSyncMarker()
+                self.flushRankSinceInput = 1
 
             case .fullFlush:
+                // A full flush outranks a plain one — it also forgets the window — so it still
+                // runs after one, the same ordering zlib's own progress rule encodes.
+                guard self.flushRankSinceInput < 2 else { break }
+
                 self.resolveDeferred()
                 self.flushBlock(final: false)
                 self.writeSyncMarker()
                 self.resetWindow()
+                self.flushRankSinceInput = 2
 
             case .finish:
                 if !self.streamEnded {
