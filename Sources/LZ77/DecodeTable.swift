@@ -21,7 +21,9 @@
 //                     16 | n = length or distance, `val` is the base and n its extra bits
 //                     32 | .. = end of block
 //                     64 = invalid code
-//                     1...15 (neither 16, 32 nor 64 set) = link, `val` is the subtable's
+//                     128 = two literals, `val` holding the first in its low byte and the
+//                     second in its high byte, `bits` covering both codes
+//                     1...15 (neither 16, 32, 64 nor 128 set) = link, `val` is the subtable's
 //                     offset and `op` the bits it is indexed by
 //
 // The ordering of those tests in the loop is the reference's, and matters: 16 first (the
@@ -32,15 +34,22 @@
 // arena bounds are the reference's ENOUGH constants, proven sufficient for every legal set of
 // lengths.
 enum DecodeTable {
-    /// The most entries a literal/length table can need (zlib's ENOUGH_LENS), and the same
-    /// for a distance table. A build that would exceed its bound reports failure rather than
-    /// writing past it — which cannot happen for lengths that passed `HuffmanTable`'s
-    /// validation, but the bound is checked, not assumed.
-    static let enoughLengths = 852
+    /// The most entries a literal/length table can need, and the same for a distance table.
+    /// A build that would exceed its bound reports failure rather than writing past it —
+    /// which cannot happen for lengths that passed `HuffmanTable`'s validation, but the
+    /// bound is checked, not assumed.
+    ///
+    /// The reference proves 852 total for a 9-bit root, of which 340 are subtables; widening
+    /// the root only moves codes out of subtables and into it, so root size plus that 340 is
+    /// a bound for any wider root.
+    static let enoughLengths = (1 << Self.literalRootBits) + 340
     static let enoughDistances = 592
 
-    /// Root index widths, as the reference chooses them.
-    static let literalRootBits = 9
+    /// A wider literal root than the reference's 9: the two-literal rewrite below can only
+    /// merge pairs whose codes fit in the root together, so extra width converts directly
+    /// into pairs on literal-heavy data, at the price of a table that still sits well inside
+    /// L1.
+    static let literalRootBits = 10
     static let distanceRootBits = 6
 
     enum Kind {
@@ -235,6 +244,41 @@ enum DecodeTable {
         // An incomplete table (the permitted single-code case) leaves one index undecodable.
         if huff != 0 {
             table[next + (huff >> drop)] = Self.entry(bits: len - drop, op: 64, val: 0)
+        }
+
+        // Literal-heavy data spends one loop iteration per byte, so where two consecutive
+        // literal codes both resolve within the root width, the root entry is rewritten to
+        // deliver the pair: `bits` covers both codes and `val` carries both bytes. Reads come
+        // from a snapshot because a merged entry can no longer serve as someone else's second
+        // half. Only root entries merge; a subtable is reached through a link, whose op the
+        // fast loop tests after the pair's.
+        if kind == .literals {
+            let rootSize = 1 << root
+            var single = [UInt32](repeating: 0, count: rootSize)
+            for index in 0 ..< rootSize { single[index] = table[index] }
+
+            for index in 0 ..< rootSize {
+                let first = single[index]
+                guard (first >> 8) & 0xFF == 0 else { continue }
+
+                let firstBits = Int(first & 0xFF)
+                guard firstBits < root else { continue }
+
+                // After the first code's bits are consumed, only `root - firstBits` bits of
+                // the next index are determined; the second entry is trustworthy exactly when
+                // its code fits within them, since shorter codes are replicated across every
+                // value of the undetermined bits.
+                let second = single[index >> firstBits]
+                guard (second >> 8) & 0xFF == 0,
+                      firstBits + Int(second & 0xFF) <= root
+                else { continue }
+
+                table[index] = Self.entry(
+                    bits: firstBits + Int(second & 0xFF),
+                    op: 128,
+                    val: Int((first >> 16) & 0xFF) | Int((second >> 16) & 0xFF) << 8
+                )
+            }
         }
 
         return (used: used, rootBits: root)
