@@ -562,6 +562,10 @@ struct InflateCore: ~Copyable {
                 case .endOfBlock:
                     self.endBlock()
                     return true
+                case .handedOffMatch:
+                    // State is already `matchCopy`; re-dispatch rather than fall into the
+                    // careful symbol loop, which expects to start at a symbol boundary.
+                    return true
                 case .invalidLengthSymbol:
                     throw DeflateError("invalid literal/length code")
                 case .invalidDistanceSymbol:
@@ -665,42 +669,53 @@ struct InflateCore: ~Copyable {
             return true
 
         case .matchCopy:
-            // The inner loop of the whole decoder: every byte of every match passes through it.
-            // Written against local copies and an unsafe view of the window so that each byte
-            // costs a load, a store and a mask, rather than that plus a bounds check and a
-            // reload of four properties through the class.
-            var position = self.windowPosition
-            var produced = self.destinationCount
-            var remaining = self.matchLength
+            // Every match the fast loop could not finish lands here, so this moves runs, not
+            // bytes: the first period of the match is in the window before anything is written,
+            // and comes out of it in at most two straight copies; past one period the pattern
+            // is already in the destination, and doubling the chunk repeats it in
+            // logarithmically many more.
+            let start = self.destinationCount
+            let want = min(self.matchLength, self.destinationCapacity - start)
 
-            let capacity = self.destinationCapacity
+            guard want > 0 else {
+                // A full destination; the match resumes on the next buffer.
+                return false
+            }
+
             let distance = self.matchDistance
             let destination = self.destination
             let mask = DeflateTables.windowMask
+            let size = DeflateTables.windowSize
 
-            let window = self.window
+            let head = min(want, distance)
+            var readPosition = (self.windowPosition &+ size &- distance) & mask
+            var copied = 0
 
-            while remaining > 0, produced < capacity {
-                let byte = window[(position &+ DeflateTables.windowSize &- distance) & mask]
-
-                destination[produced] = byte
-                window[position] = byte
-
-                position = (position &+ 1) & mask
-                produced &+= 1
-                remaining &-= 1
+            while copied < head {
+                let run = min(head - copied, size - readPosition)
+                (destination + start + copied).update(from: self.window + readPosition, count: run)
+                readPosition = (readPosition &+ run) & mask
+                copied += run
             }
 
-            // However many the loop managed, which is what the match had left less what it has
-            // left now.
-            self.totalProduced &+= self.matchLength &- remaining
+            // Each copy stays behind its source by `chunk`, a multiple of the period, so the
+            // ranges never overlap and the pattern is preserved.
+            var chunk = distance
+            while copied < want {
+                let run = min(chunk, want - copied)
+                (destination + start + copied)
+                    .update(from: destination + start + copied - chunk, count: run)
+                copied += run
+                chunk <<= 1
+            }
 
-            self.windowPosition = position
-            self.destinationCount = produced
-            self.matchLength = remaining
+            self.syncWindow(from: destination + start, count: want)
+            self.totalProduced &+= want
+            self.destinationCount = start + want
+            self.matchLength -= want
 
             guard self.matchLength == 0 else {
-                // Match unfinished, so the loop above ended on a full destination.
+                // Match unfinished, so the destination is now full.
                 return false
             }
 
@@ -765,6 +780,7 @@ struct InflateCore: ~Copyable {
 
     private enum FastOutcome {
         case paused
+        case handedOffMatch
         case endOfBlock
         case invalidLengthSymbol
         case invalidDistanceSymbol
@@ -772,9 +788,8 @@ struct InflateCore: ~Copyable {
     }
 
     /// The reference's `inflate_fast`, in this decoder's terms: while there is enough input
-    /// that an eight-byte load cannot run off the end, and enough output room that a maximal
-    /// match cannot either, decode whole symbols against the packed tables with every check
-    /// hoisted out of the loop.
+    /// that an eight-byte load cannot run off the end, decode whole symbols against the packed
+    /// tables with every check hoisted out of the loop.
     ///
     /// Runs on locals and reconciles once, on any exit: whole bytes over-read are handed back
     /// to the reader — restoring the at-most-seven-bit invariant `pulledInputCount` documents —
@@ -783,25 +798,32 @@ struct InflateCore: ~Copyable {
     /// call's output, which is most of them; the window is read only for distances reaching
     /// back past the call boundary.
     ///
-    /// Never entered mid-symbol and never exits mid-symbol, which is what lets it coexist with
-    /// the careful path's resumability: pausing here means "at a symbol boundary, out of
-    /// slack", and the careful loop picks up from exactly that boundary.
+    /// Output is filled to the brim, not to a slack margin: a caller decompressing row by row
+    /// hands over a buffer exactly one row long, and a loop that stopped a maximal match short
+    /// of the end would push the tail of every row through the resumable path, which decodes a
+    /// symbol several times slower. So a literal is checked against the real capacity, a match
+    /// against the room it actually needs — and one that does not fit is handed to the
+    /// `matchCopy` state with its bits already consumed, which is the one exit here that is
+    /// not at a symbol boundary and the state field is what records it.
+    ///
+    /// Never entered mid-symbol, which is what lets it coexist with the careful path's
+    /// resumability: `paused` means "at a symbol boundary, out of input or room", and the
+    /// careful loop picks up from exactly that boundary.
     private mutating func inflateFast() -> FastOutcome {
         let input = self.reader.rawInput
         guard let inBase = input.baseAddress else { return .paused }
 
         // 48 bits covers the longest symbol pair (15 + 5 + 15 + 13), so one refill per
-        // iteration is enough; 272 of output slack covers a maximal match of 258 plus a wide
-        // copy's overshoot.
+        // iteration is enough.
         let inLimit = input.count - 7
-        let outLimit = self.destinationCapacity - 272
+        let capacity = self.destinationCapacity
 
         var inOffset = self.reader.rawInputOffset
         var hold = self.reader.rawBuffer
         var bits = self.reader.rawBitCount
         var produced = self.destinationCount
 
-        guard inOffset < inLimit, produced < outLimit else { return .paused }
+        guard inOffset < inLimit, produced < capacity else { return .paused }
 
         let out = self.destination
         let window = self.window
@@ -842,6 +864,22 @@ struct InflateCore: ~Copyable {
                     break symbol
                 }
 
+                if op & 128 != 0 {
+                    // A merged pair: `took` above already covered both codes. Checked before
+                    // the link test, which bit 128 would otherwise satisfy.
+                    out[produced] = UInt8(truncatingIfNeeded: entry >> 16)
+                    if produced &+ 1 < capacity {
+                        out[produced &+ 1] = UInt8(truncatingIfNeeded: entry >> 24)
+                        produced &+= 2
+                        break symbol
+                    }
+                    // Room for one of the pair: the second parks where the careful loop puts
+                    // bytes decoded with nowhere to go.
+                    produced &+= 1
+                    self.heldLiteral = UInt8(truncatingIfNeeded: entry >> 24)
+                    break run
+                }
+
                 if op & 16 != 0 {
                     var length = Int(entry >> 16)
                     let lengthExtra = op & 15
@@ -875,6 +913,17 @@ struct InflateCore: ~Copyable {
                                 break run
                             }
 
+                            if produced &+ length > capacity {
+                                // The match's bits are already consumed, so this exit is not
+                                // at a symbol boundary; the matchCopy state is what records a
+                                // match caught mid-air, and it fills whatever room is left.
+                                self.matchLength = length
+                                self.matchDistance = dist
+                                self.state = .matchCopy
+                                outcome = .handedOffMatch
+                                break run
+                            }
+
                             if dist <= produced {
                                 // The whole match lies inside this call's own output, which is
                                 // contiguous — no window, no masking. Eight bytes at a time is
@@ -883,7 +932,14 @@ struct InflateCore: ~Copyable {
                                 let src = out + (produced - dist)
                                 let dst = out + produced
 
-                                if dist >= 8 {
+                                if dist == 1 {
+                                    dst.update(repeating: src.pointee, count: length)
+                                } else if dist >= 8,
+                                          produced &+ ((length &+ 7) & ~7) <= capacity {
+                                    // The wide loop rounds the copy up to whole chunks, so it
+                                    // runs only when the rounded-up end still fits; the spilled
+                                    // bytes sit past `produced`, rewritten by later symbols or
+                                    // never handed out.
                                     var index = 0
                                     while index < length {
                                         let chunk = UnsafeRawPointer(src + index)
@@ -892,8 +948,6 @@ struct InflateCore: ~Copyable {
                                             .storeBytes(of: chunk, as: UInt64.self)
                                         index &+= 8
                                     }
-                                } else if dist == 1 {
-                                    dst.update(repeating: src.pointee, count: length)
                                 } else {
                                     for index in 0 ..< length {
                                         dst[index] = src[index]
@@ -953,17 +1007,20 @@ struct InflateCore: ~Copyable {
                 break run
             }
 
-            if inOffset >= inLimit || produced >= outLimit {
+            if inOffset >= inLimit || produced >= capacity {
                 break run
             }
         }
 
         // Hand back the whole bytes the wide refills over-read, which is what keeps
-        // `pulledInputCount` exact: at most seven bits stay buffered, less than a byte, the
-        // same invariant the careful reader maintains.
-        let giveBack = bits >> 3
+        // `pulledInputCount` exact. Capped at the current offset because the reader may have
+        // entered holding bits carried over from an earlier input buffer — a read that failed
+        // at that buffer's end leaves its last bytes buffered, and the next buffer starts the
+        // offset over — and those bits have no byte here to give back to. They stay buffered,
+        // exactly as the careful reader would have kept them.
+        let giveBack = min(bits >> 3, inOffset)
         inOffset &-= giveBack
-        bits &= 7
+        bits &-= giveBack << 3
         hold &= (UInt64(1) << UInt64(bits)) - 1
 
         self.reader.restoreRaw(buffer: hold, bitCount: bits, inputOffset: inOffset)
