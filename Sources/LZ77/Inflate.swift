@@ -1013,11 +1013,14 @@ struct InflateCore: ~Copyable {
         }
 
         // Hand back the whole bytes the wide refills over-read, which is what keeps
-        // `pulledInputCount` exact: at most seven bits stay buffered, less than a byte, the
-        // same invariant the careful reader maintains.
-        let giveBack = bits >> 3
+        // `pulledInputCount` exact. Capped at the current offset because the reader may have
+        // entered holding bits carried over from an earlier input buffer — a read that failed
+        // at that buffer's end leaves its last bytes buffered, and the next buffer starts the
+        // offset over — and those bits have no byte here to give back to. They stay buffered,
+        // exactly as the careful reader would have kept them.
+        let giveBack = min(bits >> 3, inOffset)
         inOffset &-= giveBack
-        bits &= 7
+        bits &-= giveBack << 3
         hold &= (UInt64(1) << UInt64(bits)) - 1
 
         self.reader.restoreRaw(buffer: hold, bitCount: bits, inputOffset: inOffset)
