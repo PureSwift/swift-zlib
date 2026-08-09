@@ -118,14 +118,14 @@ struct DecodeTableTests {
     @Test("Codes longer than the root resolve through subtables")
     func subtables() throws {
         // A complete canonical set with one code at every length up to 15: lengths past the
-        // 9-bit root land in subtables, which is the half of the layout the fixed alphabets
-        // never exercise.
+        // root land in subtables, which is the half of the layout the fixed alphabets never
+        // exercise.
         var lengths = [UInt8](1 ... 14)
         lengths.append(15)
         lengths.append(15)
 
         let (table, rootBits) = try #require(Self.build(.literals, lengths))
-        #expect(rootBits == 9)
+        #expect(rootBits == DecodeTable.literalRootBits)
 
         for (symbol, code, length) in Self.canonicalCodes(lengths) {
             let hold = Self.reversed(code, bits: length) | (~UInt64(0) << UInt64(length))
