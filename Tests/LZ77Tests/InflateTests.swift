@@ -141,6 +141,68 @@ struct InflateTests {
         }
     }
 
+    /// Chunked input against a tiny output buffer, together. A read that fails at one input
+    /// buffer's end leaves that buffer's last bytes in the bit reader, and the next buffer
+    /// restarts the byte count from zero — so the fast loop can find itself holding more
+    /// buffered bits than the current buffer ever supplied. Handing those back as if they
+    /// were this buffer's is the bug this pins: the consumed count goes negative, the caller
+    /// re-offers bytes already decoded, and the output silently diverges downstream.
+    ///
+    /// The output buffer is smaller than any match so that every symbol crosses the paths
+    /// that pause and resume; the odd input chunk size walks the buffer boundary across every
+    /// bit alignment over the run.
+    @Test("Chunked input and a three-byte output buffer agree with the whole-stream answer",
+          arguments: [17, 61, 64, 257])
+    func chunkedInputTinyOutput(chunkSize: Int) throws {
+        // Matchy but not uniform, so the stream mixes literals, short and long matches.
+        var payload: [UInt8] = []
+        var state: UInt32 = 0x12345678
+        while payload.count < 30000 {
+            state = state &* 1664525 &+ 1013904223
+            let run = Int(state >> 28) &+ 3
+            let byte = [UInt8(ascii: "a"), UInt8(ascii: "b"), UInt8(ascii: "c"),
+                        UInt8(ascii: "d")][Int((state >> 16) & 3)]
+            payload.append(contentsOf: [UInt8](repeating: byte, count: run))
+        }
+
+        let compressed = try DeflateTests.compress(payload, level: 6)
+        let whole = try Self.inflate(compressed, into: payload.count + 64)
+        #expect(whole == payload)
+
+        let stream = Inflate()
+        var piecemeal: [UInt8] = []
+        var out = [UInt8](repeating: 0, count: 3)
+        var offset = 0
+
+        try compressed.withUnsafeBufferPointer { buffer in
+            while true {
+                if stream.needsInput, offset < buffer.count {
+                    let size = min(chunkSize, buffer.count - offset)
+                    stream.setInput(
+                        UnsafeBufferPointer(start: buffer.baseAddress! + offset, count: size)
+                    )
+                    offset += size
+                }
+
+                let made = try out.withUnsafeMutableBufferPointer { slice in
+                    try stream.inflate(into: slice.baseAddress!, count: slice.count)
+                }
+                piecemeal.append(contentsOf: out[0 ..< made])
+
+                // The consumed count is what a wrapper advances its own cursor by, so it may
+                // never run ahead of the buffer or behind zero — behind zero being exactly
+                // what over-returning bits carried in from an earlier buffer produces.
+                #expect(stream.pulledInputCount >= 0)
+                #expect(stream.pulledInputCount <= chunkSize)
+
+                if stream.isFinished { break }
+                if made == 0, stream.needsInput, offset >= buffer.count { break }
+            }
+        }
+
+        #expect(piecemeal == whole)
+    }
+
     /// A distance pointing further back than anything produced would read window bytes that
     /// were never written, which is the shape of every out-of-bounds read this format invites.
     @Test("A match reaching before the start of the stream is refused")
