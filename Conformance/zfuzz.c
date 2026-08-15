@@ -12,6 +12,14 @@
  * agree on is the verdict and, for accepted streams, the bytes; the code-sequence hash is
  * informational, because the interleaving of Z_OK and Z_BUF_ERROR while starved for input
  * is not part of the contract. run_fuzz.sh encodes exactly that comparison.
+ *
+ * encode mode (run with the library under test): the same payload variety as gen, but
+ * compressed by *this* library - streamed deflate under a per-stream draw of level, framing,
+ * input and output chunk sizes, and periodic sync or full flushes - and written undamaged.
+ * Prints one manifest line per stream: the payload's length and hash, in check's own field
+ * format. Every stream must then check out as rc1 with exactly the manifest's numbers, and
+ * the reference doing that checking is what makes this a differential test of the encoder:
+ * whatever this library wrote, the reference must read back to the byte.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +27,13 @@
 #include <zlib.h>
 
 #define STREAMS 3000
+
+/* The most a compressed stream may occupy.  Encode mode can legitimately get close: a
+ * one-byte input chunking with a flush every third chunk pays block framing per handful
+ * of payload bytes, which multiplies a hundred-kilobyte payload several times over.
+ * Check reads with the same cap, and it must: a stream read short decodes as a valid
+ * prefix that simply stops, which looks exactly like an encoder that lost its tail. */
+#define STREAM_CAP (1 << 20)
 
 static unsigned long long rs = 0x243F6A8885A308D3ULL;
 static unsigned long long rng(void) {
@@ -48,7 +63,7 @@ static size_t make_payload(unsigned char *out, size_t cap) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: zfuzz gen dir [seed] | zfuzz check dir\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: zfuzz gen dir [seed] | zfuzz encode dir [seed] | zfuzz check dir\n"); return 2; }
     const char *dir = argv[2];
     char path[1024];
 
@@ -88,12 +103,95 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(argv[1], "encode") == 0) {
+        unsigned char *payload = malloc(100000);
+        unsigned char *compressed = malloc(STREAM_CAP);
+
+        if (argc > 3) rs ^= strtoull(argv[3], NULL, 0);
+        fprintf(stderr, "seed %llx\n", rs);
+
+        /* Chunk sizes chosen the way check's patterns are: extremes and awkward primes.
+         * The flush cadence is in *chunks*, so a one-byte chunk size with a short cadence
+         * flushes brutally often - the point, since a flush mid-block is what forces the
+         * encoder to cut and resume where a whole-buffer call never would. */
+        static const size_t insizes[]  = { 1, 3, 7, 64, 997, 4096, 65536 };
+        static const size_t outsizes[] = { 1, 4, 257, 4096, 65536 };
+
+        for (int i = 0; i < STREAMS; i++) {
+            size_t len = make_payload(payload, 100000);
+            int level = (int)(rng() % 10);
+            int wbits = 15;
+            switch (rng() % 3) { case 0: wbits = 15; break; case 1: wbits = -15; break; default: wbits = 31; }
+
+            size_t inchunk = insizes[rng() % 7];
+            size_t outchunk = outsizes[rng() % 5];
+            unsigned cadence = rng() % 3 == 0 ? 3 + (unsigned)(rng() % 20) : 0;
+            int flushkind = rng() % 2 ? Z_SYNC_FLUSH : Z_FULL_FLUSH;
+
+            unsigned long long payhash = 1469598103934665603ULL;
+            for (size_t b = 0; b < len; b++) { payhash ^= payload[b]; payhash *= 1099511628211ULL; }
+
+            z_stream s; memset(&s, 0, sizeof(s));
+            if (deflateInit2(&s, level, Z_DEFLATED, wbits, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+                fprintf(stderr, "s%04d deflateInit2 failed\n", i);
+                return 1;
+            }
+
+            size_t inpos = 0, clen = 0;
+            unsigned steps = 0;
+            int rc = Z_OK;
+
+            for (;;) {
+                size_t take = inchunk;
+                if (take > len - inpos) take = len - inpos;
+                s.next_in = payload + inpos; s.avail_in = (uInt)take;
+
+                int flush = inpos + take >= len ? Z_FINISH
+                          : cadence && ++steps % cadence == 0 ? flushkind
+                          : Z_NO_FLUSH;
+
+                for (;;) {
+                    size_t room = STREAM_CAP - clen;
+                    if (room > outchunk) room = outchunk;
+                    if (room == 0) { fprintf(stderr, "s%04d overflow\n", i); return 1; }
+
+                    s.next_out = compressed + clen; s.avail_out = (uInt)room;
+                    rc = deflate(&s, flush);
+                    clen += room - s.avail_out;
+
+                    if (rc == Z_STREAM_END) break;
+                    if (rc != Z_OK && rc != Z_BUF_ERROR) {
+                        fprintf(stderr, "s%04d deflate returned %d\n", i, rc);
+                        return 1;
+                    }
+                    /* Z_FINISH drains until the end; anything else is done once the input
+                     * is taken and there was room left over, which is deflate's signal
+                     * that a pending flush has been fully written out too. */
+                    if (flush != Z_FINISH && s.avail_in == 0 && s.avail_out != 0) break;
+                }
+
+                inpos += take;
+                if (rc == Z_STREAM_END) break;
+            }
+            deflateEnd(&s);
+
+            snprintf(path, sizeof(path), "%s/s%04d_%d.bin", dir, i, wbits);
+            FILE *f = fopen(path, "wb");
+            if (!f) { perror("fopen"); return 1; }
+            fwrite(compressed, 1, clen, f);
+            fclose(f);
+
+            printf("s%04d len%zu out%llx\n", i, len, payhash);
+        }
+        return 0;
+    }
+
     /* check mode: chunked decode, every stream, several patterns */
     static const struct { size_t in, out; } patterns[] = {
         { 1u << 20, 1u << 20 }, { 1, 1 }, { 7, 13 }, { 3, 4096 }, { 4096, 3 }, { 271, 259 },
     };
 
-    unsigned char *compressed = malloc(200000);
+    unsigned char *compressed = malloc(STREAM_CAP);
     unsigned char *outbuf = malloc(1 << 20);
 
     for (int i = 0; i < STREAMS; i++) {
@@ -106,7 +204,7 @@ int main(int argc, char **argv) {
             if (f) { wbits = wb[k]; break; }
         }
         if (!f) { printf("s%04d missing\n", i); continue; }
-        size_t clen = fread(compressed, 1, 200000, f);
+        size_t clen = fread(compressed, 1, STREAM_CAP, f);
         fclose(f);
 
         for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
