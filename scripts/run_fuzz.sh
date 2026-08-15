@@ -17,6 +17,12 @@
 # What may differ: how many bytes came out before an error was reported - two decoders may
 # discover the same corruption at different distances into their own read-ahead - and the
 # interleaving of intermediate return codes on the way.
+#
+# Then the same test runs the other way: the candidate *encodes* a batch - streamed, under
+# varied levels, framings, chunkings and flushes - and the reference decodes every stream.
+# Here the bar is absolute rather than comparative: every stream must be accepted and must
+# decode to exactly the payload the encoder was given, because whatever this library wrote,
+# zlib must read back to the byte.
 
 set -euo pipefail
 
@@ -73,3 +79,28 @@ paste "$WORK/reference.out" "$WORK/candidate.out" | awk '
         exit bad > 0 ? 1 : 0;
     }
 '
+
+mkdir "$WORK/encoded"
+"$WORK/candidate" encode "$WORK/encoded" "$SEED" > "$WORK/manifest.out"
+
+"$WORK/reference" check "$WORK/encoded" > "$WORK/refdecode.out"
+"$WORK/candidate" check "$WORK/encoded" > "$WORK/canddecode.out"
+
+# Every stream the candidate wrote must be accepted and reproduce the manifest exactly -
+# by the reference, which is the point, and by the candidate itself, which is a round trip
+# over a stream distribution the decode fuzz never sees.
+for side in refdecode canddecode; do
+    awk -v side="$side" '
+        NR == FNR { len[$1] = $2; hash[$1] = $3; next }
+        {
+            if ($3 != "rc1" || len[$1] != $4 || hash[$1] != $6) {
+                print side " mismatch:", $0; bad++; next;
+            }
+            checked++;
+        }
+        END {
+            printf "  %d %s probes compared, %d disagreements\n", checked + bad, side, bad;
+            exit bad > 0 ? 1 : 0;
+        }
+    ' "$WORK/manifest.out" "$WORK/$side.out"
+done
