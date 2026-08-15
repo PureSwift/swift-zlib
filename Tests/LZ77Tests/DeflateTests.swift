@@ -146,4 +146,27 @@ struct DeflateTests {
         #expect(compressed.count == 2)
         #expect(compressed[0] != 0x78)
     }
+
+    /// A block closes when its symbol buffer fills, not when it has covered some quota of
+    /// input — a match is one symbol however much it covers, so highly compressible input
+    /// gets long blocks and pays for few sets of tables.  A mebibyte of slowly drifting
+    /// pattern compresses to a few thousand symbols; cut every 64 KiB of input instead,
+    /// and the sixteen extra tables show up directly in the output size.
+    ///
+    /// Fed in chunks much smaller than the window, so the window trims while the open
+    /// block spans more input than a stored block could hold — the path where nothing pins
+    /// the block's bytes any more and its start is left behind.
+    @Test("A compressible block outlives the input it covers")
+    func blocksCloseOnSymbols() throws {
+        var payload: [UInt8] = []
+
+        for index in 0 ..< (1 << 20) {
+            payload.append(UInt8(truncatingIfNeeded: index % 251 &+ index / 4096))
+        }
+
+        let compressed = try Self.compress(payload, level: 6, feeding: 1000)
+
+        #expect(try InflateTests.inflate(compressed, into: payload.count) == payload)
+        #expect(compressed.count < 6300)
+    }
 }
