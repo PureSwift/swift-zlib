@@ -169,4 +169,32 @@ struct DeflateTests {
         #expect(try InflateTests.inflate(compressed, into: payload.count) == payload)
         #expect(compressed.count < 6300)
     }
+
+    /// A minimum-length match from far back is refused at the lazy levels: three bytes from
+    /// five thousand back spend more on the distance than the three literals they replace,
+    /// and every such distance also bloats the distance tree for the matches actually worth
+    /// having.  Sixteen-symbol noise is full of them — any given trigram recurs every few
+    /// thousand bytes by chance alone — so an encoder that takes them all writes measurably
+    /// more than one that lets them go.
+    @Test("A far three-byte match is left as literals")
+    func farMatchesRefused() throws {
+        var payload: [UInt8] = []
+        var state: UInt32 = 0x2545_F491
+
+        for _ in 0 ..< 200 {
+            payload.append(contentsOf: [0xF1, 0xF2, 0xF3])
+
+            for _ in 0 ..< 4997 {
+                state ^= state << 13
+                state ^= state >> 17
+                state ^= state << 5
+                payload.append(0x20 + UInt8(truncatingIfNeeded: state & 0x0F))
+            }
+        }
+
+        let compressed = try Self.compress(payload, level: 6)
+
+        #expect(try InflateTests.inflate(compressed, into: payload.count) == payload)
+        #expect(compressed.count < 571_000)
+    }
 }

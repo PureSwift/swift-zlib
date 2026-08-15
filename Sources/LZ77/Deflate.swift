@@ -103,6 +103,13 @@ struct DeflateCore: ~Copyable {
     private static let hashBits = 15
     private static let hashSize = 1 << hashBits
     private static let minMatch = 3
+
+    /// The distance beyond which a shortest match is not worth taking at the lazy levels: a
+    /// three-byte match this far back spends more bits on its distance than the three
+    /// literals it replaces would have cost.  The reference's TOO_FAR, applied where it
+    /// applies it — only to matches of exactly the minimum length, and only in the lazy
+    /// loop; the greedy levels take everything.
+    private static let tooFar = 4096
     private static let maxMatch = 258
 
     private var writer = BitWriter()
@@ -686,7 +693,7 @@ struct DeflateCore: ~Copyable {
                 // would usually lose, and it is the single most expensive thing here. A
                 // head entry already out of the window skips the search the same way: the
                 // walk's first test would refuse it, so there is no call worth making.
-                let current: (length: Int, distance: Int)? =
+                var current: (length: Int, distance: Int)? =
                     candidate < max(0, cursor - windowSize)
                         || (heldLength > 0 && heldLength >= effort.maxLazy)
                     ? nil
@@ -694,6 +701,13 @@ struct DeflateCore: ~Copyable {
                         bytes, at: cursor, limit: limit, holding: heldLength,
                         from: candidate, chain: chain, effort: effort, windowSize: windowSize
                     )
+
+                // A minimum-length match from too far back loses money — see `tooFar`.  The
+                // search keeps the nearest of equal lengths, so a far three is also proof
+                // there was no near three.
+                if let found = current, found.length == Self.minMatch, found.distance > Self.tooFar {
+                    current = nil
+                }
 
                 if key >= 0 {
                     chain[cursor & Self.chainMask] = Int32(truncatingIfNeeded: candidate)
