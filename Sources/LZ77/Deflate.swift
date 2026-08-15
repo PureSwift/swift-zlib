@@ -160,12 +160,18 @@ struct DeflateCore: ~Copyable {
     private static let literalSymbolCount = 286
     private static let distanceSymbolCount = 30
 
-    /// A stored block's length is a sixteen-bit field, so a block that might become one cannot
-    /// cover more input than that.
+    /// A stored block's length is a sixteen-bit field, so a block covering more input than
+    /// this cannot be written as one.  Not a bound on how much input a block may cover: a
+    /// block that outgrows it merely loses the stored form as an option.
     private static let maxBlockBytes = 65535
 
-    /// A cap on the symbol buffer, so a block of highly compressible input closes on a bound
-    /// this module chose rather than on whatever `maxBlockBytes` happens to allow.
+    /// How many symbols a block collects before it closes, which is the only thing that closes
+    /// one mid-stream.  Cutting on symbols rather than on input covered is what keeps highly
+    /// compressible input from paying for a fresh set of tables every few tens of kilobytes:
+    /// a match is one symbol however much it covers, so the compressible stretches get long
+    /// blocks and few tables, and incompressible input — one symbol per byte — still cuts
+    /// often enough for the tables to track it.  The reference's symbol buffer at its default
+    /// memory level holds exactly this many.
     private static let maxBlockSymbols = 16384
 
     /// Whether the stream's final block has been written into the pending output.
@@ -573,7 +579,6 @@ struct DeflateCore: ~Copyable {
             var cursor = self.cursor
             var symbolCount = self.symbolCount
             var deferredMatch = self.deferred
-            var blockStart = self.blockStart
 
             // Committing to a match: the symbol goes into the block, and the positions the
             // match covers go into the hash chain — except inside long matches at the greedy
@@ -651,13 +656,11 @@ struct DeflateCore: ~Copyable {
                         cursor += 1
                     }
 
-                    if cursor - blockStart >= Self.maxBlockBytes
-                        || symbolCount >= Self.maxBlockSymbols {
+                    if symbolCount >= Self.maxBlockSymbols {
                         self.cursor = cursor
                         self.symbolCount = symbolCount
                         self.flushBlock(final: false)
                         symbolCount = self.symbolCount
-                        blockStart = self.blockStart
                     }
                 }
 
@@ -734,15 +737,12 @@ struct DeflateCore: ~Copyable {
                     cursor += 1
                 }
 
-                let emittedEnd = deferredMatch == nil ? cursor : cursor - 1
-                if emittedEnd - blockStart >= Self.maxBlockBytes
-                    || symbolCount >= Self.maxBlockSymbols {
+                if symbolCount >= Self.maxBlockSymbols {
                     self.cursor = cursor
                     self.symbolCount = symbolCount
                     self.deferred = deferredMatch
                     self.flushBlock(final: false)
                     symbolCount = self.symbolCount
-                    blockStart = self.blockStart
                 }
             }
 
@@ -792,8 +792,7 @@ struct DeflateCore: ~Copyable {
     }
 
     private var blockIsFull: Bool {
-        self.emittedEnd - self.blockStart >= Self.maxBlockBytes
-            || self.symbolCount >= Self.maxBlockSymbols
+        self.symbolCount >= Self.maxBlockSymbols
     }
 
     /// Drops history no match can reach any more, so `pending` does not grow with the stream.
@@ -802,11 +801,21 @@ struct DeflateCore: ~Copyable {
         guard self.cursor > keep * 2 else { return }
 
         // Never drop what the open block has not been written out of: if it closes as a stored
-        // block, those bytes are what it writes. And only whole multiples of the chain ring:
-        // a position's slot is `position & chainMask`, so a rebase by anything else would move
-        // every entry to a slot nothing will ever read it from. The reference slides its
-        // window in the same fixed steps for the same reason.
-        let drop = min(self.cursor - keep, self.blockStart) & ~Self.chainMask
+        // block, those bytes are what it writes. But a block that has already covered more
+        // than a stored block's sixteen-bit length can never be one, so nothing pins its
+        // bytes — `blockStart` is simply left behind, negative once the trim passes it, which
+        // is harmless because the flush decides storability from the *difference* against the
+        // block's end, and a rebase moves both ends equally. The reference does the same
+        // thing by voiding the block's buffer pointer when its window slides past it.
+        //
+        // And only whole multiples of the chain ring: a position's slot is
+        // `position & chainMask`, so a rebase by anything else would move every entry to a
+        // slot nothing will ever read it from. The reference slides its window in the same
+        // fixed steps for the same reason.
+        let pin = self.emittedEnd - self.blockStart > Self.maxBlockBytes
+            ? self.cursor - keep
+            : self.blockStart
+        let drop = min(self.cursor - keep, pin) & ~Self.chainMask
         guard drop > 0 else { return }
 
         self.pending.removeFirst(drop)
