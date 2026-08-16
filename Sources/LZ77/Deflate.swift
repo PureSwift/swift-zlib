@@ -211,8 +211,14 @@ struct DeflateCore: ~Copyable {
         self.effort = Effort.forLevel(level)
         self.head = .allocate(capacity: Self.hashSize)
         self.head.initialize(repeating: -1, count: Self.hashSize)
+
+        // The chain ring is not cleared, and no walk can tell: a slot is only ever read
+        // through a position the head reaches, every inserted position writes its slot
+        // before the head points at it, and a slot is not recycled until the position it
+        // held is out of any window's reach.  The head cannot get the same treatment — it
+        // is read at every key the input hashes to — and it alone is why creating an
+        // encoder costs what it does.
         self.chain = .allocate(capacity: Self.chainSize)
-        self.chain.initialize(repeating: -1, count: Self.chainSize)
         self.symbols = .allocate(capacity: Self.maxBlockSymbols + 8)
         self.literalFrequencies = .allocate(capacity: Self.literalSymbolCount)
         self.literalFrequencies.initialize(repeating: 0, count: Self.literalSymbolCount)
