@@ -110,17 +110,24 @@ struct InflateCore: ~Copyable {
     private(set) var isFinished = false
 
     init() {
-        // Neither buffer is cleared, because neither can be read where nothing was written:
-        // a distance reaching past the bytes produced is a data error before it is a read,
-        // and the packed tables are only consulted once a build has filled them in.  A
-        // stream object has to be cheap — every decode of something small is mostly setup.
-        self.window = .allocate(capacity: DeflateTables.windowSize)
-        self.packed = .allocate(capacity: DecodeTable.enoughLengths + DecodeTable.enoughDistances)
+        // One allocation carries both buffers, the tables aligned first and the window's
+        // bytes after them.  Neither is cleared, because neither can be read where nothing
+        // was written: a distance reaching past the bytes produced is a data error before
+        // it is a read, and the packed tables are only consulted once a build has filled
+        // them in.  A stream object has to be cheap — every decode of something small is
+        // mostly setup.
+        let tableEntries = DecodeTable.enoughLengths + DecodeTable.enoughDistances
+        let block = UnsafeMutableRawPointer.allocate(
+            byteCount: tableEntries * MemoryLayout<UInt32>.stride + DeflateTables.windowSize,
+            alignment: MemoryLayout<UInt32>.alignment
+        )
+        self.packed = block.bindMemory(to: UInt32.self, capacity: tableEntries)
+        self.window = UnsafeMutableRawPointer(self.packed + tableEntries)
+            .bindMemory(to: UInt8.self, capacity: DeflateTables.windowSize)
     }
 
     deinit {
-        self.window.deallocate()
-        self.packed.deallocate()
+        UnsafeMutableRawPointer(self.packed).deallocate()
     }
 
     var needsInput: Bool {
