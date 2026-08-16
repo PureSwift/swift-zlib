@@ -110,12 +110,12 @@ struct InflateCore: ~Copyable {
     private(set) var isFinished = false
 
     init() {
+        // Neither buffer is cleared, because neither can be read where nothing was written:
+        // a distance reaching past the bytes produced is a data error before it is a read,
+        // and the packed tables are only consulted once a build has filled them in.  A
+        // stream object has to be cheap — every decode of something small is mostly setup.
         self.window = .allocate(capacity: DeflateTables.windowSize)
-        self.window.initialize(repeating: 0, count: DeflateTables.windowSize)
-
-        let packedCapacity = DecodeTable.enoughLengths + DecodeTable.enoughDistances
-        self.packed = .allocate(capacity: packedCapacity)
-        self.packed.initialize(repeating: 0, count: packedCapacity)
+        self.packed = .allocate(capacity: DecodeTable.enoughLengths + DecodeTable.enoughDistances)
     }
 
     deinit {
@@ -367,12 +367,19 @@ struct InflateCore: ~Copyable {
                 self.state = .storedLength
 
             case 1:
-                self.literalTable = try HuffmanTable(lengths: DeflateTables.fixedLiteralLengths)
-                self.distanceTable = try HuffmanTable(lengths: DeflateTables.fixedDistanceLengths)
-                self.buildPackedTables(
-                    literalLengths: DeflateTables.fixedLiteralLengths,
-                    distanceLengths: DeflateTables.fixedDistanceLengths
-                )
+                // The fixed alphabets never change, so their tables are built once for the
+                // whole process and copied in — the reference carries the equivalent as
+                // constant data, and rebuilding them per stream was most of what a small
+                // decode cost.
+                let fixed = Self.fixedTables
+                self.literalTable = fixed.literal
+                self.distanceTable = fixed.distance
+                fixed.packed.withUnsafeBufferPointer {
+                    self.packed.update(from: $0.baseAddress!, count: $0.count)
+                }
+                self.packedLiteralRoot = fixed.literalRoot
+                self.packedDistanceRoot = fixed.distanceRoot
+                self.packedValid = true
                 self.symbolPartial = HuffmanTable.Partial()
                 self.state = .blockData
 
@@ -728,6 +735,52 @@ struct InflateCore: ~Copyable {
     }
 
     // -- the fast path ----------------------------------------------------------
+
+    /// The fixed alphabets' tables (§3.2.6), built once and shared by every stream.
+    ///
+    /// The code-length arrays these are built from are compile-time constants, so the build
+    /// cannot fail; the packed image is what a stream's own arena receives, in one copy.
+    static let fixedTables: (
+        literal: HuffmanTable,
+        distance: HuffmanTable,
+        packed: [UInt32],
+        literalRoot: Int,
+        distanceRoot: Int
+    ) = {
+        let literal = try! HuffmanTable(lengths: DeflateTables.fixedLiteralLengths)
+        let distance = try! HuffmanTable(lengths: DeflateTables.fixedDistanceLengths)
+
+        var packed = [UInt32](
+            repeating: 0,
+            count: DecodeTable.enoughLengths + DecodeTable.enoughDistances
+        )
+        var literalRoot = 0
+        var distanceRoot = 0
+
+        packed.withUnsafeMutableBufferPointer { buffer in
+            guard
+                let literals = DecodeTable.build(
+                    .literals,
+                    lengths: DeflateTables.fixedLiteralLengths,
+                    into: buffer.baseAddress!,
+                    capacity: DecodeTable.enoughLengths
+                ),
+                let distances = DecodeTable.build(
+                    .distances,
+                    lengths: DeflateTables.fixedDistanceLengths,
+                    into: buffer.baseAddress! + DecodeTable.enoughLengths,
+                    capacity: DecodeTable.enoughDistances
+                )
+            else {
+                fatalError("the fixed alphabets build packed tables")
+            }
+
+            literalRoot = literals.rootBits
+            distanceRoot = distances.rootBits
+        }
+
+        return (literal, distance, packed, literalRoot, distanceRoot)
+    }()
 
     private mutating func buildPackedTables(literalLengths: [UInt8], distanceLengths: [UInt8]) {
         let literal = DecodeTable.build(
